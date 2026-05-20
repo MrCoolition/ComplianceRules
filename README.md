@@ -9,4 +9,4 @@ Snowflake Streamlit app for reviewing analyst rule decisions, running harvested 
 3. Select the database/schema that contains the Snowflake Git repository object.
 4. Choose this repo folder and use `streamlit_app.py` as the Streamlit entry point.
 
-The `.streamlit/config.toml` and `snowpark_streamlit_fix.py` files force a light theme for Snowflake-hosted Streamlit controls, menus, date pickers, popovers, tables, and charts. That fixes the blacked-out segmented controls, search/date inputs, advanced-filter menus, and chart panels seen in Snowflake.
+The app keeps the styling fixes inside `streamlit_app.py`, with `.streamlit/config.toml` setting the Snowflake Streamlit theme. That fixes the blacked-out segmented controls, search/date inputs, advanced-filter menus, and chart panels seen in Snowflake.
