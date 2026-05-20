@@ -4,9 +4,12 @@ from datetime import date, datetime
 from typing import Any, Iterable, Mapping
 import hashlib
 import html
+import io
 import math
 import re
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 
 import altair as alt
 import pandas as pd
@@ -110,6 +113,43 @@ APP_COLUMNS = [
     "Last Saved",
     "Assignment",
     "Status",
+]
+
+
+DISPLAY_COLUMNS = [
+    "Selected",
+    "Business",
+    "Type",
+    "Case#",
+    "Division",
+    "Sector",
+    "Vendor",
+    "Unit Name",
+    "Description",
+    "Manufacturer",
+    "Brand",
+    "Parent Category",
+    "Sub Category",
+    "DIN",
+    "MIN",
+    "Usage",
+    "One-Time or Permanent",
+    "Meets Criteria",
+    "Compass APL",
+    "K12 APL",
+    "Pantry",
+    "In CAT",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Rule Applied",
+    "Needs Review",
+    "Validation Status",
+    "Analyst Notes",
+    "Excluded",
+    "Excluded Reason",
+    "Last Sync",
+    "Last Saved",
 ]
 
 
@@ -278,6 +318,7 @@ DEFAULT_LAMB_WESTON_ALLOWLIST = [
 
 
 APPROVED_BRANDS_COMPASS = {"sweet streets", "evergood", "passport", "medtrition", "uproot", "european imports"}
+APPROVED_BRANDS_CANADA = {"diversey"}
 APPROVED_BRANDS_HEALTHTRUST = {"passport", "evergood", "medtrition"}
 MORRISON_BALLARD_SUBBRANDS = {"pjs coffee", "new orleans roast", "crescent city"}
 SPECIAL_COMPASS_APPROVED_MANUFACTURERS = {"great lakes", "sara lee frozen", "bob's red mill"}
@@ -806,8 +847,61 @@ def _extract_desc_column_names(desc_df: pd.DataFrame) -> list[str]:
     return [str(name).upper() for name in desc_df[name_col].tolist()]
 
 
+def _show_table_matches(session, object_name: str, scope_sql: str) -> list[dict[str, str]]:
+    escaped_name = str(object_name).replace("'", "''")
+    try:
+        df = session.sql(f"show terse tables like '{escaped_name}' {scope_sql}").to_pandas()
+    except Exception:
+        return []
+
+    if df.empty:
+        return []
+
+    col_map = {str(col).lower(): col for col in df.columns}
+    required = {"name", "database_name", "schema_name"}
+    if not required.issubset(col_map.keys()):
+        return []
+
+    exact = df[df[col_map["name"]].astype(str).str.upper() == str(object_name).upper()]
+    matches: list[dict[str, str]] = []
+    for _, row in exact.iterrows():
+        matches.append(
+            {
+                "database_name": str(row[col_map["database_name"]]),
+                "schema_name": str(row[col_map["schema_name"]]),
+                "name": str(row[col_map["name"]]),
+            }
+        )
+    return matches
+
+
+def _pick_table_match(matches: list[dict[str, str]], current_db: str, current_schema: str) -> dict[str, str] | None:
+    if not matches:
+        return None
+
+    if current_db and current_schema:
+        for match in matches:
+            if (
+                match["database_name"].upper() == current_db.upper()
+                and match["schema_name"].upper() == current_schema.upper()
+            ):
+                return match
+
+    if current_db:
+        db_matches = [m for m in matches if m["database_name"].upper() == current_db.upper()]
+        if len(db_matches) == 1:
+            return db_matches[0]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
 def resolve_table_name(session, table_name: str) -> str | None:
     cache = st.session_state.setdefault("_resolved_table_names", {})
+    notes = st.session_state.setdefault("_table_resolution_notes", {})
+
     key = str(table_name).strip()
     if key in cache:
         return cache[key]
@@ -819,16 +913,26 @@ def resolve_table_name(session, table_name: str) -> str | None:
     candidates: list[str] = []
 
     if not parts:
+        notes[key] = "Blank table name."
         cache[key] = None
         return None
     if _extract_desc_column_names(_describe_table(session, key)):
-        cache[key] = key
-        return key
+        if len(parts) == 1 and current_db and current_schema:
+            resolved = _build_fqn(current_db, current_schema, parts[0])
+        elif len(parts) == 2 and current_db:
+            resolved = _build_fqn(current_db, parts[0], parts[1])
+        else:
+            resolved = _build_fqn(*parts[-3:])
+        cache[key] = resolved
+        return resolved
 
     if len(parts) == 3:
         candidates.append(_build_fqn(parts[0], parts[1], parts[2]))
-    elif len(parts) == 2 and current_db:
-        candidates.append(_build_fqn(current_db, parts[0], parts[1]))
+    elif len(parts) == 2:
+        schema_name, object_name = parts
+        if current_db:
+            candidates.append(_build_fqn(current_db, schema_name, object_name))
+        candidates.append(_build_fqn(schema_name, object_name))
     else:
         object_name = parts[0]
         if TABLE_DATABASE and TABLE_SCHEMA:
@@ -836,10 +940,35 @@ def resolve_table_name(session, table_name: str) -> str | None:
         if current_db and current_schema:
             candidates.append(_build_fqn(current_db, current_schema, object_name))
 
+        search_matches: list[dict[str, str]] = []
+        if current_db:
+            search_matches.extend(
+                _show_table_matches(session, object_name, f"in database {_quote_ident(current_db)}")
+            )
+        if not search_matches:
+            search_matches.extend(_show_table_matches(session, object_name, "in account"))
+
+        picked = _pick_table_match(search_matches, current_db, current_schema)
+        if picked is not None:
+            resolved = _build_fqn(picked["database_name"], picked["schema_name"], picked["name"])
+            cache[key] = resolved
+            return resolved
+
+        if search_matches:
+            candidate_list = ", ".join(
+                sorted({_build_fqn(m["database_name"], m["schema_name"], m["name"]) for m in search_matches})
+            )
+            notes[key] = f"Found matching tables but could not safely choose one: {candidate_list}."
+        else:
+            notes[key] = "No matching table found in the current database or visible account objects."
+
     for candidate in list(dict.fromkeys(candidates)):
         if _extract_desc_column_names(_describe_table(session, candidate)):
             cache[key] = candidate
             return candidate
+
+    if key not in notes:
+        notes[key] = "DESC TABLE failed for the provided name and no alternative resolution succeeded."
 
     cache[key] = None
     return None
@@ -850,6 +979,10 @@ def get_table_columns(session, table_name: str) -> list[str]:
     if not resolved_name:
         return []
     return _extract_desc_column_names(_describe_table(session, resolved_name))
+
+
+def table_exists(session, table_name: str) -> bool:
+    return resolve_table_name(session, table_name) is not None
 
 
 def load_table_if_exists(session, table_name: str) -> pd.DataFrame:
@@ -864,6 +997,9 @@ def load_table_if_exists(session, table_name: str) -> pd.DataFrame:
 
 def build_missing_table_message(session, table_name: str) -> str:
     context = get_session_context(session)
+    notes = st.session_state.setdefault("_table_resolution_notes", {})
+    note = notes.get(str(table_name), "")
+
     pieces = [f"Could not resolve table {table_name}."]
     if context:
         pieces.append(
@@ -872,25 +1008,255 @@ def build_missing_table_message(session, table_name: str) -> str:
             f"schema={context.get('CURRENT_SCHEMA') or '[none]'}, "
             f"role={context.get('CURRENT_ROLE') or '[none]'}."
         )
+    if note:
+        pieces.append(note)
     pieces.append("Use a fully qualified table name or set TABLE_DATABASE / TABLE_SCHEMA at the top of the app.")
     return " ".join(pieces)
 
 
-def load_workflow_sheet(uploaded_file) -> tuple[pd.DataFrame, str]:
-    sheet_name = "Sheet1"
+XLSX_NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "pkg_rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+
+BUILTIN_DATE_NUMFMT_IDS = {
+    14, 15, 16, 17, 18, 19, 20, 21, 22,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+    45, 46, 47, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+}
+
+
+def _xlsx_tag(name: str) -> str:
+    return f"{{{XLSX_NS['main']}}}{name}"
+
+
+def _strip_excel_format_tokens(fmt: str) -> str:
+    cleaned = re.sub(r'"[^"]*"', '', fmt)
+    cleaned = re.sub(r'\\.', '', cleaned)
+    cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
+    return cleaned.lower()
+
+
+def _is_excel_date_format(fmt: str) -> bool:
+    if not fmt:
+        return False
+    cleaned = _strip_excel_format_tokens(fmt)
+    has_date_token = any(token in cleaned for token in ["yy", "dd", "mm", "m/", "/m", "hh", "ss"])
+    has_numeric_placeholder = any(token in cleaned for token in ["0", "#"])
+    if has_date_token:
+        return True
+    if has_numeric_placeholder and not has_date_token:
+        return False
+    return False
+
+
+def _excel_serial_to_timestamp(serial: float, date1904: bool = False) -> pd.Timestamp | pd.NaT:
+    if pd.isna(serial):
+        return pd.NaT
+    base = pd.Timestamp("1904-01-01") if date1904 else pd.Timestamp("1899-12-30")
     try:
-        excel_file = pd.ExcelFile(uploaded_file)
-        sheet_name = excel_file.sheet_names[0]
-        workflow = excel_file.parse(sheet_name=sheet_name)
-    except Exception as exc:
-        st.error(f"Unable to read workbook: {exc}")
+        return base + pd.to_timedelta(float(serial), unit="D")
+    except Exception:
+        return pd.NaT
+
+
+def _get_uploaded_file_bytes(uploaded_file) -> bytes:
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    if hasattr(uploaded_file, "read"):
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        data = uploaded_file.read()
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        return data
+    if isinstance(uploaded_file, (bytes, bytearray)):
+        return bytes(uploaded_file)
+    raise TypeError("Unsupported uploaded file object.")
+
+
+def _column_ref_to_index(cell_ref: str) -> int:
+    letters = ''.join(ch for ch in cell_ref if ch.isalpha()).upper()
+    if not letters:
+        return 0
+    value = 0
+    for ch in letters:
+        value = value * 26 + (ord(ch) - ord('A') + 1)
+    return value - 1
+
+
+def _load_shared_strings(xlsx: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in xlsx.namelist():
+        return []
+    root = ET.fromstring(xlsx.read("xl/sharedStrings.xml"))
+    values: list[str] = []
+    for si in root.findall(_xlsx_tag("si")):
+        text_parts = [node.text or "" for node in si.iter(_xlsx_tag("t"))]
+        values.append("".join(text_parts))
+    return values
+
+
+def _load_date_style_indexes(xlsx: zipfile.ZipFile) -> tuple[set[int], bool]:
+    date1904 = False
+    if "xl/workbook.xml" in xlsx.namelist():
+        workbook_root = ET.fromstring(xlsx.read("xl/workbook.xml"))
+        workbook_pr = workbook_root.find(_xlsx_tag("workbookPr"))
+        if workbook_pr is not None:
+            date1904 = str(workbook_pr.attrib.get("date1904", "0")).lower() in {"1", "true"}
+
+    if "xl/styles.xml" not in xlsx.namelist():
+        return set(), date1904
+
+    styles_root = ET.fromstring(xlsx.read("xl/styles.xml"))
+    custom_numfmts: dict[int, str] = {}
+    numfmts_elem = styles_root.find(_xlsx_tag("numFmts"))
+    if numfmts_elem is not None:
+        for numfmt in numfmts_elem.findall(_xlsx_tag("numFmt")):
+            numfmt_id = int(numfmt.attrib.get("numFmtId", "0"))
+            custom_numfmts[numfmt_id] = numfmt.attrib.get("formatCode", "")
+
+    date_style_indexes: set[int] = set()
+    cellxfs_elem = styles_root.find(_xlsx_tag("cellXfs"))
+    if cellxfs_elem is not None:
+        for idx, xf in enumerate(cellxfs_elem.findall(_xlsx_tag("xf"))):
+            numfmt_id = int(xf.attrib.get("numFmtId", "0"))
+            fmt_code = custom_numfmts.get(numfmt_id, "")
+            if numfmt_id in BUILTIN_DATE_NUMFMT_IDS or _is_excel_date_format(fmt_code):
+                date_style_indexes.add(idx)
+
+    return date_style_indexes, date1904
+
+
+def _normalize_sheet_path(target: str) -> str:
+    cleaned = target.replace('\\', '/').lstrip('/')
+    if cleaned.startswith("xl/"):
+        return cleaned
+    if cleaned.startswith("worksheets/"):
+        return f"xl/{cleaned}"
+    return f"xl/{cleaned}"
+
+
+def _get_first_sheet_path_and_name(xlsx: zipfile.ZipFile) -> tuple[str, str]:
+    workbook_root = ET.fromstring(xlsx.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(xlsx.read("xl/_rels/workbook.xml.rels"))
+
+    rel_map: dict[str, str] = {}
+    for rel in rels_root.findall(f"{{{XLSX_NS['pkg_rel']}}}Relationship"):
+        rel_id = rel.attrib.get("Id")
+        target = rel.attrib.get("Target", "")
+        if rel_id:
+            rel_map[rel_id] = target
+
+    sheets_elem = workbook_root.find(_xlsx_tag("sheets"))
+    if sheets_elem is None:
+        raise ValueError("No sheets found in workbook.")
+
+    first_sheet = sheets_elem.findall(_xlsx_tag("sheet"))[0]
+    rel_id = first_sheet.attrib.get(f"{{{XLSX_NS['rel']}}}id")
+    if not rel_id or rel_id not in rel_map:
+        raise ValueError("Unable to resolve first worksheet relationship.")
+
+    sheet_name = first_sheet.attrib.get("name", "Sheet1")
+    sheet_path = _normalize_sheet_path(rel_map[rel_id])
+    return sheet_path, sheet_name
+
+
+def _parse_cell_value(cell: ET.Element, shared_strings: list[str], date_style_indexes: set[int], date1904: bool):
+    cell_type = cell.attrib.get("t")
+    style_idx = int(cell.attrib.get("s", "0")) if cell.attrib.get("s") is not None else 0
+
+    if cell_type == "inlineStr":
+        is_elem = cell.find(_xlsx_tag("is"))
+        if is_elem is None:
+            return pd.NA
+        text_parts = [node.text or "" for node in is_elem.iter(_xlsx_tag("t"))]
+        value = "".join(text_parts)
+        return value if value != "" else pd.NA
+
+    value_elem = cell.find(_xlsx_tag("v"))
+    raw_value = value_elem.text if value_elem is not None else None
+    if raw_value is None:
+        return pd.NA
+
+    if cell_type == "s":
+        idx = int(raw_value)
+        return shared_strings[idx] if 0 <= idx < len(shared_strings) else pd.NA
+    if cell_type == "b":
+        return raw_value == "1"
+    if cell_type in {"str", "e"}:
+        return raw_value
+
+    if style_idx in date_style_indexes:
+        try:
+            return _excel_serial_to_timestamp(float(raw_value), date1904)
+        except Exception:
+            return raw_value
+
+    try:
+        numeric_value = float(raw_value)
+        if math.isfinite(numeric_value) and numeric_value.is_integer():
+            return int(numeric_value)
+        return numeric_value
+    except Exception:
+        return raw_value
+
+
+def read_xlsx_first_sheet(uploaded_file) -> tuple[pd.DataFrame, str]:
+    file_bytes = _get_uploaded_file_bytes(uploaded_file)
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as xlsx:
+        sheet_path, sheet_name = _get_first_sheet_path_and_name(xlsx)
+        shared_strings = _load_shared_strings(xlsx)
+        date_style_indexes, date1904 = _load_date_style_indexes(xlsx)
+
+        sheet_root = ET.fromstring(xlsx.read(sheet_path))
+        sheet_data = sheet_root.find(_xlsx_tag("sheetData"))
+        if sheet_data is None:
+            return pd.DataFrame(), sheet_name
+
+        parsed_rows: list[dict[int, object]] = []
+        max_col_idx = -1
+
+        for row in sheet_data.findall(_xlsx_tag("row")):
+            row_values: dict[int, object] = {}
+            for cell in row.findall(_xlsx_tag("c")):
+                cell_ref = cell.attrib.get("r", "")
+                col_idx = _column_ref_to_index(cell_ref)
+                row_values[col_idx] = _parse_cell_value(cell, shared_strings, date_style_indexes, date1904)
+                if col_idx > max_col_idx:
+                    max_col_idx = col_idx
+            parsed_rows.append(row_values)
+
+    if not parsed_rows or max_col_idx < 0:
         return pd.DataFrame(), sheet_name
 
+    grid = [[row.get(col_idx, pd.NA) for col_idx in range(max_col_idx + 1)] for row in parsed_rows]
+    header_row = grid[0]
+    data_rows = grid[1:]
+
+    columns: list[str] = []
+    for idx, header_value in enumerate(header_row):
+        if pd.isna(header_value):
+            columns.append(f"Unnamed: {idx}")
+        else:
+            text = str(header_value).strip()
+            columns.append(text if text else f"Unnamed: {idx}")
+
+    df = pd.DataFrame(data_rows, columns=columns)
+    if not df.empty:
+        empty_mask = df.apply(lambda row: all(pd.isna(v) or str(v).strip() == "" for v in row), axis=1)
+        df = df.loc[~empty_mask].reset_index(drop=True)
+    return df, sheet_name
+
+
+def load_workflow_sheet(uploaded_file) -> tuple[pd.DataFrame, str]:
+    workflow, sheet_name = read_xlsx_first_sheet(uploaded_file)
     workflow = sanitize_dataframe(workflow)
     workflow = normalize_columns(workflow, COLUMN_ALIASES)
     workflow = collapse_duplicate_columns(workflow)
     workflow = ensure_columns(workflow, SOURCE_COLUMNS)
-    return collapse_duplicate_columns(workflow), sheet_name
+    workflow = collapse_duplicate_columns(workflow)
+    return workflow, sheet_name
 
 
 def append_text_field(df: pd.DataFrame, mask: pd.Series, column: str, value: str) -> None:
@@ -1280,7 +1646,9 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     scope = out["is_canada"] & ~out["Excluded"]
 
-    diversey_mask = scope & (out["brand_lc"].eq("diversey") | out["manufacturer_lc"].eq("diversey"))
+    diversey_mask = scope & (
+        out["brand_lc"].eq("diversey") | out["manufacturer_lc"].eq("diversey")
+    )
     if diversey_mask.any():
         approve_with_stock_context(out, diversey_mask, "R-039")
 
@@ -1291,11 +1659,20 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
     has_conversion = scope & out["has_conversion"]
     if has_conversion.any():
         set_action_key(out, has_conversion, "CHECK_IF_USE_RIGHT_IS_APL", "R-031")
-        append_note(out, has_conversion & out["is_one_time"] & (out["usage_num"] > 10), "Escalate Canada 1X > 10 cases.")
+        note_mask = has_conversion & out["is_one_time"] & (out["usage_num"] <= 10)
+        if note_mask.any():
+            append_note(out, note_mask, "If use right is not APL, approve requested 1X.")
+        review_mask = has_conversion & out["is_one_time"] & (out["usage_num"] > 10)
+        if review_mask.any():
+            append_note(out, review_mask, "Escalate Canada 1X > 10 cases to Betty MacDonald / Joy Pereira.")
+            append_rule(out, review_mask, "R-034")
 
     approval_mask = scope & ~has_conversion & (out["is_core_apl"] | out["is_s1"] | out["is_pantry"])
     if approval_mask.any():
         approve_with_stock_context(out, approval_mask, "R-030")
+        stock_ok_mask = approval_mask & out["upstream_action_key"].isin({"ON_MOG_CHECK_ATTRIBUTE", "CANNOT_ADD_NOT_IN_STOCK"})
+        if stock_ok_mask.any():
+            append_rule(out, stock_ok_mask, "R-035")
 
     low_usage_one_time = scope & ~has_conversion & out["is_one_time"] & ~(
         out["is_core_apl"] | out["is_s1"] | out["is_pantry"]
@@ -1303,8 +1680,15 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
     if low_usage_one_time.any():
         set_action_key(out, low_usage_one_time, "1X", "R-033")
 
+    high_usage_review = scope & ~has_conversion & out["is_one_time"] & ~(
+        out["is_core_apl"] | out["is_s1"] | out["is_pantry"]
+    ) & (out["usage_num"] > 10)
+    if high_usage_review.any():
+        append_note(out, high_usage_review, "Escalate Canada 1X > 10 cases to Betty MacDonald / Joy Pereira.")
+        append_rule(out, high_usage_review, "R-034")
+
     deny_mask = scope & out["ACTION"].fillna("").eq("") & ~(
-        diversey_mask | smallwares_mask | has_conversion | approval_mask | low_usage_one_time
+        diversey_mask | smallwares_mask | has_conversion | approval_mask | low_usage_one_time | high_usage_review
     )
     if deny_mask.any():
         deny_with_stock_context(out, deny_mask, "R-037")
@@ -1313,7 +1697,7 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def apply_healthtrust_rules(df: pd.DataFrame) -> pd.DataFrame:
+def apply_healthtrust_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
     out = df.copy()
     scope = out["is_healthtrust"] & ~out["Excluded"]
 
@@ -1321,8 +1705,8 @@ def apply_healthtrust_rules(df: pd.DataFrame) -> pd.DataFrame:
     if invalid_info.any():
         set_action_key(out, invalid_info, "INVALID_INFORMATION", "R-060")
 
-    approved_brand = out["brand_lc"].isin(APPROVED_BRANDS_HEALTHTRUST)
     srf_scope = scope & out["is_srf"]
+    approved_brand = out["brand_lc"].isin(APPROVED_BRANDS_HEALTHTRUST)
     srf_approve = srf_scope & (out["is_s1"] | approved_brand)
     if srf_approve.any():
         set_action_key(out, srf_approve, "OK", "R-050")
@@ -1344,13 +1728,30 @@ def apply_healthtrust_rules(df: pd.DataFrame) -> pd.DataFrame:
     raw_chicken_mask = scope & contains_word(out["Sub Category"], r"chicken breast unbreaded raw")
     if raw_chicken_mask.any():
         set_action_key(out, raw_chicken_mask, "SEND_TO_CDM", "R-055")
-        append_note(out, raw_chicken_mask, "4 oz / 5 oz cases need supplier matrix review.")
+        append_note(out, raw_chicken_mask, "4 oz / 5 oz cases need BSB DC supplier matrix for MIN/MFR mapping.")
 
     approve_standard = scope & ~raw_chicken_mask & ~conversion_mask & (
-        out["is_s1"] | out["is_diverse"] | out["is_foh"] | approved_brand | out["meets_criteria_ge_10"]
+        out["is_s1"] | out["is_diverse"] | out["is_foh"] | approved_brand
     )
     if approve_standard.any():
         approve_with_stock_context(out, approve_standard, "R-054")
+
+    pantry_mask = scope & ~raw_chicken_mask & ~conversion_mask & out["is_pantry"]
+    if pantry_mask.any():
+        approve_with_stock_context(out, pantry_mask, "R-056")
+
+    criteria_mask = scope & ~raw_chicken_mask & ~conversion_mask & out["meets_criteria_ge_10"]
+    criteria_mask = criteria_mask & out["ACTION"].fillna("").eq("")
+    if criteria_mask.any():
+        approve_with_stock_context(out, criteria_mask, "R-057")
+
+    glaring_no = scope & (
+        contains_word(out["Sub Category"], r"gloves|soup frozen")
+        | (contains_word(out["Sub Category"], r"chicken breast unbreaded raw") & (out["usage_num"] >= 15) & (out["meets_criteria_num"] <= 0))
+    )
+    if glaring_no.any():
+        append_note(out, glaring_no, "HealthTrust guided review: glaring-no example from process doc; consider NO or Find Alt 1st.")
+        append_rule(out, glaring_no, "R-058")
 
     unresolved = scope & out["ACTION"].fillna("").eq("")
     if unresolved.any():
@@ -1376,9 +1777,12 @@ def apply_compass_srf_rules(df: pd.DataFrame) -> pd.DataFrame:
         set_action_key(out, use_right_mask, "USE_RIGHT", "R-070")
 
     approve_brand = out["brand_lc"].isin(APPROVED_BRANDS_COMPASS)
-    approve_scope = scope & (out["is_s1"] | out["is_diverse"] | out["is_foh"] | approve_brand)
+    approve_scope = scope & (
+        out["is_s1"] | out["is_diverse"] | out["is_foh"] | approve_brand
+    )
     if approve_scope.any():
         set_action_key(out, approve_scope, "OK", "R-072")
+        append_rule(out, approve_scope, "R-074")
 
     k12_scope = scope & contains_word(out["Division"], r"schools|chartwells") & out["is_k12_apl"]
     if k12_scope.any():
@@ -1398,6 +1802,7 @@ def apply_compass_srf_rules(df: pd.DataFrame) -> pd.DataFrame:
     in_catalog_not_marked = scope & out["ACTION"].fillna("").eq("") & out["is_in_catalog"]
     if in_catalog_not_marked.any():
         set_action_key(out, in_catalog_not_marked, "IN_STOCK_ADD_AS_PRF", "R-077")
+        append_note(out, in_catalog_not_marked, "Compass SRF in-catalog case added as PRF guidance.")
 
     no_mask = scope & out["ACTION"].fillna("").eq("")
     if no_mask.any():
@@ -1407,19 +1812,43 @@ def apply_compass_srf_rules(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def apply_compass_prf_sorf_rules(df: pd.DataFrame) -> pd.DataFrame:
+def apply_compass_prf_sorf_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
     out = df.copy()
     scope = out["is_compass"] & (out["is_prf"] | out["is_sorf"]) & ~out["Excluded"]
 
+    levy_sponsorship = scope & out["is_levy"] & contains_word(out["Reason for request"], r"sponsorship item")
+    if levy_sponsorship.any():
+        approve_with_stock_context(out, levy_sponsorship, "R-079")
+
     conversion_mask = scope & out["has_conversion"]
+    cookie_dough = conversion_mask & contains_word(out["Sub Category"], r"cookie dough|dough cookie")
+    if cookie_dough.any():
+        append_note(out, cookie_dough, "Cookie dough matrix lookup required.")
+        append_rule(out, cookie_dough, "R-079")
+
+    chicken_bacon_matrix = conversion_mask & (
+        contains_word(out["Sub Category"], r"chicken breast unbreaded raw|pork bacon")
+        | contains_word(out["Description"], r"chicken breast|bacon")
+    )
+    if chicken_bacon_matrix.any():
+        append_note(out, chicken_bacon_matrix, "Matrix lookup required for chicken/bacon conversion.")
+        append_rule(out, chicken_bacon_matrix, "R-079")
+
+    schools_k12_override = conversion_mask & contains_word(out["Division"], r"schools") & out["is_k12_apl"]
+    if schools_k12_override.any():
+        out.loc[schools_k12_override, "Conversion DIN"] = ""
+        append_rule(out, schools_k12_override, "R-071")
+        append_note(out, schools_k12_override, "K12 conversion override applied.")
+
     low_usage_conversion = conversion_mask & out["is_one_time"] & (out["usage_num"] < 15) & out["ACTION"].fillna("").eq("")
     if low_usage_conversion.any():
         set_action_key(out, low_usage_conversion, "1X", "R-079")
-        append_note(out, low_usage_conversion, "Low-usage 1X conversion approved; confirm before removing conversion.")
+        append_note(out, low_usage_conversion, "Low-usage 1X conversion approved; remove conversion after analyst confirmation.")
 
     sponsored_conversion = conversion_mask & contains_word(out["Reason for request"], r"sponsorship|allocation|commodity")
     if sponsored_conversion.any():
         approve_with_stock_context(out, sponsored_conversion, "R-079")
+        append_note(out, sponsored_conversion, "Requested item should override conversion when sponsorship/allocation/commodity applies.")
 
     remaining_conversion = conversion_mask & out["ACTION"].fillna("").eq("")
     if remaining_conversion.any():
@@ -1431,6 +1860,8 @@ def apply_compass_prf_sorf_rules(df: pd.DataFrame) -> pd.DataFrame:
     )
     if approve_scope.any():
         approve_with_stock_context(out, approve_scope, "R-080")
+        append_rule(out, approve_scope, "R-081")
+        append_rule(out, approve_scope, "R-074")
 
     k12_scope = scope & ~conversion_mask & contains_word(out["Division"], r"schools|chartwells") & out["is_k12_apl"]
     if k12_scope.any():
@@ -1445,8 +1876,13 @@ def apply_compass_prf_sorf_rules(df: pd.DataFrame) -> pd.DataFrame:
         approve_with_stock_context(out, criteria_scope, "R-084")
 
     sponsorship_reason = scope & ~conversion_mask & contains_word(out["Reason for request"], r"sponsorship")
+    commodity_allocation = scope & ~conversion_mask & contains_word(out["Division"], r"schools") & contains_word(
+        out["Reason for request"], r"commodity|allocation"
+    )
     if sponsorship_reason.any():
         approve_with_stock_context(out, sponsorship_reason, "R-079")
+    if commodity_allocation.any():
+        approve_with_stock_context(out, commodity_allocation, "R-079")
 
     halal_scope = scope & contains_word(out["Description"], r"halal")
     if halal_scope.any():
@@ -1472,10 +1908,17 @@ def apply_compass_exception_overrides(df: pd.DataFrame, refs: dict[str, object])
     smallwares_scope = scope & contains_word(out["Parent Category"], r"smallwares")
     if smallwares_scope.any():
         set_action_key(out, smallwares_scope, "SUPPLY_AMERICA", "R-088")
+        append_note(out, smallwares_scope, "Charges approved for all sectors; Essity 1X is approved exception.")
 
     frozen_soup_no = scope & contains_word(out["Sub Category"], r"soup frozen") & ~out["brand_lc"].eq("chef francisco")
     if frozen_soup_no.any():
         set_action_key(out, frozen_soup_no, "NO", "R-089")
+
+    fresh_fish_no = scope & contains_word(out["Sub Category"], r"fresh") & contains_word(
+        out["Description"].fillna(""), r"fish"
+    ) & ~contains_word(out["Sector"], r"ccl")
+    if fresh_fish_no.any():
+        set_action_key(out, fresh_fish_no, "NO", "R-090")
 
     produce_mog = scope & contains_word(out["Sub Category"], r"fresh") & (
         contains_word(out["Description"], r"vegetable") | contains_word(out["Description"], r"fruit")
@@ -1492,6 +1935,20 @@ def apply_compass_exception_overrides(df: pd.DataFrame, refs: dict[str, object])
     if higliner_no.any():
         set_action_key(out, higliner_no, "NO", "R-093")
 
+    searab_no = scope & out["manufacturer_lc"].eq("searab") & ~contains_word(out["Parent Category"], r"laundry")
+    if searab_no.any():
+        set_action_key(out, searab_no, "NO", "R-092")
+
+    searab_laundry = scope & out["manufacturer_lc"].eq("searab") & contains_word(out["Parent Category"], r"laundry")
+    if searab_laundry.any():
+        approve_with_stock_context(out, searab_laundry, "R-092")
+
+    ballard_morrison = scope & out["brand_lc"].isin(MORRISON_BALLARD_SUBBRANDS) & contains_word(
+        out["Sector"].fillna("").astype(str) + " " + out["Division"].fillna("").astype(str), r"morrison"
+    )
+    if ballard_morrison.any():
+        approve_with_stock_context(out, ballard_morrison, "R-092")
+
     approved_brand_scope = scope & out["brand_lc"].isin(SPECIAL_COMPASS_APPROVED_BRANDS)
     if approved_brand_scope.any():
         approve_with_stock_context(out, approved_brand_scope, "R-092")
@@ -1504,22 +1961,32 @@ def apply_compass_exception_overrides(df: pd.DataFrame, refs: dict[str, object])
     if soda_stream_prf.any():
         approve_with_stock_context(out, soda_stream_prf, "R-092")
 
-    ballard_morrison = scope & out["brand_lc"].isin(MORRISON_BALLARD_SUBBRANDS) & contains_word(
-        out["Sector"].fillna("").astype(str) + " " + out["Division"].fillna("").astype(str),
-        r"morrison",
-    )
-    if ballard_morrison.any():
-        approve_with_stock_context(out, ballard_morrison, "R-092")
+    great_lakes_review = scope & out["manufacturer_lc"].eq("great lakes") & (out["usage_num"] >= 15) & (out["meets_criteria_num"] <= 0)
+    if great_lakes_review.any():
+        append_note(out, great_lakes_review, "Great Lakes with high usage and 0% VA should be reviewed with CDM.")
+        append_rule(out, great_lakes_review, "R-092")
+
+    importers_guided = scope & contains_word(out["Manufacturer"], r"unknown - importers|unknown importers")
+    if importers_guided.any():
+        append_note(out, importers_guided, "Manufacturer Unknown - Importers needs MyOrders confirmation for European Imports.")
+        append_rule(out, importers_guided, "R-092")
 
     high_usage_one_time = scope & out["is_one_time"] & (out["usage_num"] >= 15) & (out["meets_criteria_num"] <= 0)
     if high_usage_one_time.any():
-        append_note(out, high_usage_one_time, "Compass 1X with usage >= 15 and 0% VA should be reviewed.")
+        append_note(out, high_usage_one_time, "Compass 1X with usage >= 15 and 0% VA should be reviewed for Check with CDM / Find Alt 1st.")
         append_rule(out, high_usage_one_time, "R-095")
 
     chicken_raw_guided = scope & contains_word(out["Sub Category"], r"chicken breast unbreaded raw")
     if chicken_raw_guided.any():
         append_note(out, chicken_raw_guided, "Chicken Breast Unbreaded Raw has matrix / nutritional / sector exceptions.")
         append_rule(out, chicken_raw_guided, "R-092")
+
+    hca_highlight = scope & contains_word(out["Division"], r"hca healthcare") & contains_word(
+        out["Vendor"], r"gfs plant city|gfs houston"
+    )
+    if hca_highlight.any():
+        append_note(out, hca_highlight, "HCA Healthcare line: remind specialist to change attribute to HC.")
+        append_rule(out, hca_highlight, "R-118")
 
     unresolved = scope & out["ACTION"].fillna("").eq("")
     if unresolved.any():
@@ -1598,6 +2065,27 @@ def run_validations(df: pd.DataFrame) -> pd.DataFrame:
         append_text_field(out, conversion_bad, "Validation Status", "Conversion row needs use right / Canada check / analyst review")
         out.loc[conversion_bad, "Needs Review"] = True
 
+    approved_invalid = out["Buysmart Action"].fillna("").astype(str).str.strip().str.lower().eq("approved") & ~(
+        out["business_key"].eq("COMPASS")
+        & out["is_prf"]
+        & out["is_permanent"]
+        & out["is_in_cat_y"]
+        & out["ACTION"].fillna("").astype(str).str.strip().str.lower().isin(["ok", "on mog. check attribute."])
+    )
+    if approved_invalid.any():
+        append_text_field(out, approved_invalid, "Validation Status", "Approved BuySmart does not meet Compass PRF Permanent Y In CAT + ok/on mog rule")
+        append_rule(out, approved_invalid, "R-116")
+        out.loc[approved_invalid, "Needs Review"] = True
+
+    denied_invalid = out["Buysmart Action"].fillna("").astype(str).str.strip().str.lower().eq("denied") & ~(
+        out["ACTION"].fillna("").astype(str).str.strip().str.lower().eq("cannot add. not in stock.")
+        & out["in_cat_key"].isin(["N", "TA"])
+    )
+    if denied_invalid.any():
+        append_text_field(out, denied_invalid, "Validation Status", "Denied BuySmart does not meet Cannot Add + N/TA rule")
+        append_rule(out, denied_invalid, "R-117")
+        out.loc[denied_invalid, "Needs Review"] = True
+
     return out
 
 
@@ -1660,9 +2148,9 @@ def run_harvested_alpha_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.D
     out = apply_foodbuy_one_rules(out)
     out = apply_hmshost_rules(out)
     out = apply_canada_rules(out)
-    out = apply_healthtrust_rules(out)
+    out = apply_healthtrust_rules(out, refs)
     out = apply_compass_srf_rules(out)
-    out = apply_compass_prf_sorf_rules(out)
+    out = apply_compass_prf_sorf_rules(out, refs)
     out = apply_compass_exception_overrides(out, refs)
     out = derive_buysmart(out)
     out = run_validations(out)
