@@ -1,24 +1,20 @@
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Any, Iterable, Mapping
-import hashlib
-import html
+from datetime import datetime, date
+from typing import Iterable, Mapping
+import uuid
+import re
 import io
 import math
-import re
-import uuid
+import html
+import hashlib
 import zipfile
 import xml.etree.ElementTree as ET
 
 import altair as alt
 import pandas as pd
 import streamlit as st
-
-try:
-    from snowflake.snowpark.context import get_active_session
-except Exception:  # Allows local preview outside Snowflake.
-    get_active_session = None
+from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(
     page_title="Analyst Rules Command Center",
@@ -27,16 +23,14 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-
 TABLE_WORKFLOW = "CLAB_PROTO_WORKFLOW_REQUEST"
 TABLE_RULE_CATALOG = "CLAB_PROTO_RULE_CATALOG"
 TABLE_LOCAL_VENDOR = "CLAB_PROTO_RULE_LOCAL_VENDOR_EXCLUSION"
 TABLE_DISALLOWED_MIN = "CLAB_PROTO_RULE_DISALLOWED_MIN"
 TABLE_ALLOWLIST = "CLAB_PROTO_RULE_APPROVED_ITEM_ALLOWLIST"
 
-TABLE_DATABASE = ""
-TABLE_SCHEMA = ""
-
+TABLE_DATABASE = ""  # optional override, e.g. MY_DB
+TABLE_SCHEMA = ""    # optional override, e.g. MY_SCHEMA
 
 SOURCE_COLUMNS = [
     "Business",
@@ -87,7 +81,6 @@ SOURCE_COLUMNS = [
     "Conversion VA%",
 ]
 
-
 APP_COLUMNS = [
     "workflow_request_id",
     "batch_id",
@@ -114,7 +107,6 @@ APP_COLUMNS = [
     "Assignment",
     "Status",
 ]
-
 
 DISPLAY_COLUMNS = [
     "Selected",
@@ -151,7 +143,6 @@ DISPLAY_COLUMNS = [
     "Last Sync",
     "Last Saved",
 ]
-
 
 COLUMN_ALIASES = {
     "Business": ["business"],
@@ -201,7 +192,6 @@ COLUMN_ALIASES = {
     "Audit Action": ["audit action", "comments / notes", "analyst notes", "notes"],
     "Conversion VA%": ["conversion va%", "conversion va"],
 }
-
 
 UI_TO_DB = {
     "workflow_request_id": "WORKFLOW_REQUEST_ID",
@@ -275,9 +265,7 @@ UI_TO_DB = {
     "Status": "STATUS",
 }
 
-
-DB_TO_UI = {db_col: ui_col for ui_col, db_col in UI_TO_DB.items()}
-
+DB_TO_UI = {v: k for k, v in UI_TO_DB.items()}
 
 DEFAULT_LOCAL_VENDORS = [
     "Baldor",
@@ -287,7 +275,6 @@ DEFAULT_LOCAL_VENDORS = [
     "Vistar Vending",
     "The Chefs Warehouse",
 ]
-
 
 DEFAULT_DISALLOWED_HIGLINER = [
     ("1029719", "Cod Fillet Beer Battered Corona 4 Oz 1/10 Lb"),
@@ -310,12 +297,18 @@ DEFAULT_DISALLOWED_HIGLINER = [
     ("06551", "Pollock Alaska Nuggets Precooked Potato Crunch Style 1 Oz 1/10 Lb"),
 ]
 
-
 DEFAULT_LAMB_WESTON_ALLOWLIST = [
-    {"MIN": "30H", "BRAND": "Lamb Weston", "DESCRIPTION": "Potato French Fry Natural Raw 1/8 In Chip Skin On 6/5 Lb"},
-    {"MIN": "L0094", "BRAND": "Sweet Things", "DESCRIPTION": "Potato Sweet Puff Mini 6/2.5 Lb"},
+    {
+        "MIN": "30H",
+        "BRAND": "Lamb Weston",
+        "DESCRIPTION": "Potato French Fry Natural Raw 1/8 In Chip Skin On 6/5 Lb",
+    },
+    {
+        "MIN": "L0094",
+        "BRAND": "Sweet Things",
+        "DESCRIPTION": "Potato Sweet Puff Mini 6/2.5 Lb",
+    },
 ]
-
 
 APPROVED_BRANDS_COMPASS = {"sweet streets", "evergood", "passport", "medtrition", "uproot", "european imports"}
 APPROVED_BRANDS_CANADA = {"diversey"}
@@ -324,7 +317,6 @@ MORRISON_BALLARD_SUBBRANDS = {"pjs coffee", "new orleans roast", "crescent city"
 SPECIAL_COMPASS_APPROVED_MANUFACTURERS = {"great lakes", "sara lee frozen", "bob's red mill"}
 SPECIAL_COMPASS_APPROVED_BRANDS = {"diversey", "passport", "uproot", "evergood", "zero acres farms", "path water"}
 SPECIAL_COMPASS_PRF_ONLY_BRANDS = {"soda stream"}
-
 
 REQUEST_BUCKET_ORDER = [
     "Mass Add",
@@ -341,7 +333,6 @@ REQUEST_BUCKET_ORDER = [
     "Special exception / analyst review",
 ]
 
-
 OUTCOME_REPORT_ORDER = [
     "approved",
     "denied",
@@ -352,7 +343,6 @@ OUTCOME_REPORT_ORDER = [
     "assigned",
     "unresolved exceptions",
 ]
-
 
 RULE_SUMMARY_DEFAULT = pd.DataFrame(
     {
@@ -369,234 +359,8 @@ RULE_SUMMARY_DEFAULT = pd.DataFrame(
     }
 )
 
-
-WORKSPACE_OPTIONS = ["Workflow Dashboard", "Outcome Reporting", "Rule Catalog"]
-WORKSPACE_META = {
-    "Workflow Dashboard": {
-        "nav": "Workflow",
-        "kicker": "Analyst operations surface",
-        "title": "Review the daily decision queue with clarity.",
-        "description": "Run harvested Alpha rules, focus the exception queue, and save analyst-ready outcomes back to Snowflake.",
-    },
-    "Outcome Reporting": {
-        "nav": "Reporting",
-        "kicker": "Operating summary",
-        "title": "Turn the working set into a publish-ready rollup.",
-        "description": "See approved, denied, use-right, and unresolved outcomes in a cleaner stakeholder view.",
-    },
-    "Rule Catalog": {
-        "nav": "Catalog",
-        "kicker": "Automation inventory",
-        "title": "Inspect the harvested rule base with confidence.",
-        "description": "Measure automation coverage, browse rule details, and spot guided recommendations.",
-    },
-}
-
-
-QUEUE_LENS_OPTIONS = ["All", "Needs Review", "Approved", "Denied", "Assigned", "Excluded"]
-OUTCOME_LENS_OPTIONS = ["All", "Approved", "Denied", "Use Right / Alt", "Needs Review"]
-
-
-WORKBENCH_COLUMNS = [
-    "Selected",
-    "Business",
-    "Type",
-    "Case#",
-    "Division",
-    "Vendor",
-    "Description",
-    "DIN",
-    "MIN",
-    "One-Time or Permanent",
-    "Meets Criteria",
-    "ACTION",
-    "If In Stock: Action",
-    "Buysmart Action",
-    "Needs Review",
-    "Validation Status",
-    "Analyst Notes",
-    "Excluded",
-    "Excluded Reason",
-    "Assignment",
-    "Status",
-    "Rule Applied",
-    "Last Sync",
-    "Last Saved",
-]
-
-
-WORKBENCH_EDITABLE_COLUMNS = {
-    "Selected",
-    "ACTION",
-    "If In Stock: Action",
-    "Buysmart Action",
-    "Needs Review",
-    "Validation Status",
-    "Analyst Notes",
-    "Excluded",
-    "Excluded Reason",
-    "Assignment",
-    "Status",
-}
-
-
-REVIEW_COLUMNS = [
-    "Business",
-    "Type",
-    "Case#",
-    "Division",
-    "Vendor",
-    "Description",
-    "ACTION",
-    "Buysmart Action",
-    "Needs Review",
-    "Validation Status",
-    "Analyst Notes",
-    "Rule Applied",
-    "Excluded",
-    "Excluded Reason",
-    "Status",
-]
-
-
-OUTCOME_DETAIL_COLUMNS = [
-    "Business",
-    "Type",
-    "Case#",
-    "Vendor",
-    "Description",
-    "One-Time or Permanent",
-    "ACTION",
-    "If In Stock: Action",
-    "Buysmart Action",
-    "Request Bucket",
-    "Outcome Reporting",
-    "Needs Review",
-    "Validation Status",
-    "Analyst Notes",
-]
-
-
-KNOWN_ACTION_OPTIONS = [
-    "",
-    "OK",
-    "1X",
-    "NO",
-    "Use Right",
-    "Find Alt 1st",
-    "Check if use right is APL",
-    "Check with CDM",
-    "Send to CDM",
-    "Invalid Information",
-    "Produce MOG",
-    "Supply America",
-    "Buy Direct - United Restaurant Supplies and Equipment",
-    "HMSHost",
-    "HMS Host",
-    "In Stock - Add as PRF",
-    "Check for S1 alt, if there isn't one, please approve",
-    "On MOG. Check Attribute.",
-    "Cannot Add. Not in Stock.",
-]
-
-
-KNOWN_IF_STOCK_OPTIONS = ["", "OK", "NO", "HMSHost", "HMS Host"]
-KNOWN_BUYSMART_OPTIONS = ["", "Approved", "Denied", "Assigned"]
-KNOWN_STATUS_OPTIONS = ["Ready", "Needs Review", "Excluded"]
-
-
-WORKFLOW_SEARCH_COLUMNS = [
-    "Business",
-    "Type",
-    "Case#",
-    "Division",
-    "Sector",
-    "Vendor",
-    "Unit Name",
-    "Description",
-    "Manufacturer",
-    "Brand",
-    "Parent Category",
-    "Sub Category",
-    "DIN",
-    "MIN",
-    "ACTION",
-    "If In Stock: Action",
-    "Buysmart Action",
-    "Rule Applied",
-    "Validation Status",
-    "Analyst Notes",
-    "Assignment",
-    "Status",
-]
-
-
-OUTCOME_SEARCH_COLUMNS = [
-    "Business",
-    "Type",
-    "Case#",
-    "Vendor",
-    "Description",
-    "ACTION",
-    "If In Stock: Action",
-    "Buysmart Action",
-    "Outcome Reporting",
-    "Analyst Notes",
-    "Validation Status",
-]
-
-
 def get_session():
-    if get_active_session is None:
-        return None
-    try:
-        return get_active_session()
-    except Exception:
-        return None
-
-
-TRUE_STRINGS = {"1", "true", "t", "yes", "y", "selected", "checked"}
-FALSE_STRINGS = {"0", "false", "f", "no", "n", "unselected", "unchecked", ""}
-
-
-def coerce_bool_series(series: pd.Series, *, default: bool = False) -> pd.Series:
-    def coerce_value(value: Any) -> bool:
-        if value is None:
-            return default
-        try:
-            if pd.isna(value):
-                return default
-        except Exception:
-            pass
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return bool(value)
-
-        text = str(value).strip().lower()
-        if text in TRUE_STRINGS:
-            return True
-        if text in FALSE_STRINGS:
-            return False
-        return default
-
-    return series.map(coerce_value).astype(bool)
-
-
-def clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
-
-
-def lower_text(value: object) -> str:
-    return clean_text(value).lower()
-
+    return get_active_session()
 
 def collapse_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     if not df.columns.duplicated().any():
@@ -608,11 +372,11 @@ def collapse_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
         matches = df.loc[:, df.columns == name]
         if matches.shape[1] == 1:
             collapsed[name] = matches.iloc[:, 0]
-            continue
-        combined = matches.iloc[:, 0]
-        for idx in range(1, matches.shape[1]):
-            combined = combined.combine_first(matches.iloc[:, idx])
-        collapsed[name] = combined
+        else:
+            combined = matches.iloc[:, 0]
+            for idx in range(1, matches.shape[1]):
+                combined = combined.combine_first(matches.iloc[:, idx])
+            collapsed[name] = combined
     return pd.DataFrame(collapsed)
 
 
@@ -654,14 +418,14 @@ def normalize_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce")
 
 
-def normalize_meets_criteria(series: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    numeric.loc[numeric > 1] = numeric.loc[numeric > 1] / 100.0
-    return numeric
+def clean_text(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
-def contains_word(series: pd.Series, pattern: str) -> pd.Series:
-    return series.fillna("").astype(str).str.contains(pattern, case=False, regex=True, na=False)
+def lower_text(value: object) -> str:
+    return clean_text(value).lower()
 
 
 def normalize_business_key(value: object) -> str:
@@ -683,7 +447,7 @@ def normalize_request_type_key(value: object) -> str:
     text = lower_text(value)
     if "mass add" in text and "srf" in text:
         return "MASS_SRF"
-    if "mass add" in text or text == "mass adds":
+    if "mass add" in text:
         return "MASS_ADD"
     if text == "prf":
         return "PRF"
@@ -705,6 +469,17 @@ def normalize_in_cat_key(value: object) -> str:
     if text == "a":
         return "A"
     return text.upper()
+
+
+def normalize_meets_criteria(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    over_one = numeric > 1
+    numeric.loc[over_one] = numeric.loc[over_one] / 100.0
+    return numeric
+
+
+def contains_word(series: pd.Series, pattern: str) -> pd.Series:
+    return series.fillna("").astype(str).str.contains(pattern, case=False, regex=True, na=False)
 
 
 def canonical_action_key(value: object) -> str:
@@ -763,9 +538,9 @@ def display_action_from_key(key: str) -> str:
         "INVALID_INFORMATION": "Invalid Information",
         "PRODUCE_MOG": "Produce MOG",
         "SUPPLY_AMERICA": "Supply America",
-        "BUY_DIRECT": "Buy Direct - United Restaurant Supplies and Equipment",
+        "BUY_DIRECT": "Buy Direct – United Restaurant Supplies and Equipment",
         "HMSHOST": "HMSHost",
-        "IN_STOCK_ADD_AS_PRF": "In Stock - Add as PRF",
+        "IN_STOCK_ADD_AS_PRF": "In Stock – Add as PRF",
         "CHECK_FOR_S1_ALT": "Check for S1 alt, if there isn't one, please approve",
         "ON_MOG_CHECK_ATTRIBUTE": "On MOG. Check Attribute.",
         "CANNOT_ADD_NOT_IN_STOCK": "Cannot Add. Not in Stock.",
@@ -774,7 +549,11 @@ def display_action_from_key(key: str) -> str:
 
 
 def display_if_stock_from_key(key: str) -> str:
-    mapping = {"OK": "OK", "NO": "NO", "HMSHOST": "HMS Host"}
+    mapping = {
+        "OK": "OK",
+        "NO": "NO",
+        "HMSHOST": "HMS Host",
+    }
     return mapping.get(key, key)
 
 
@@ -790,7 +569,9 @@ def normalize_buysmart_key(value: object) -> str:
 
 
 def display_buysmart_from_key(key: str) -> str:
-    return {"APPROVED": "Approved", "DENIED": "Denied", "ASSIGNED": "Assigned"}.get(key, key)
+    mapping = {"APPROVED": "Approved", "DENIED": "Denied", "ASSIGNED": "Assigned"}
+    return mapping.get(key, key)
+
 
 
 def _quote_ident(identifier: str) -> str:
@@ -809,8 +590,6 @@ def _build_fqn(*parts: str) -> str:
 
 
 def get_session_context(session) -> dict[str, str]:
-    if session is None:
-        return {}
     try:
         df = session.sql(
             """
@@ -823,15 +602,15 @@ def get_session_context(session) -> dict[str, str]:
         ).to_pandas()
     except Exception:
         return {}
+
     if df.empty:
         return {}
+
     row = df.iloc[0].to_dict()
     return {str(k): ("" if pd.isna(v) else str(v)) for k, v in row.items()}
 
 
 def _describe_table(session, table_name: str) -> pd.DataFrame:
-    if session is None:
-        return pd.DataFrame()
     try:
         return session.sql(f"desc table {table_name}").to_pandas()
     except Exception:
@@ -898,6 +677,25 @@ def _pick_table_match(matches: list[dict[str, str]], current_db: str, current_sc
     return None
 
 
+def build_missing_table_message(session, table_name: str) -> str:
+    context = get_session_context(session)
+    notes = st.session_state.setdefault("_table_resolution_notes", {})
+    note = notes.get(str(table_name), "")
+
+    pieces = [f"Could not resolve table {table_name}."]
+    if context:
+        pieces.append(
+            "Session context: "
+            f"database={context.get('CURRENT_DATABASE') or '[none]'}, "
+            f"schema={context.get('CURRENT_SCHEMA') or '[none]'}, "
+            f"role={context.get('CURRENT_ROLE') or '[none]'}."
+        )
+    if note:
+        pieces.append(note)
+    pieces.append("Use a fully qualified table name or set TABLE_DATABASE / TABLE_SCHEMA at the top of the app.")
+    return " ".join(pieces)
+
+
 def resolve_table_name(session, table_name: str) -> str | None:
     cache = st.session_state.setdefault("_resolved_table_names", {})
     notes = st.session_state.setdefault("_table_resolution_notes", {})
@@ -916,6 +714,7 @@ def resolve_table_name(session, table_name: str) -> str | None:
         notes[key] = "Blank table name."
         cache[key] = None
         return None
+
     if _extract_desc_column_names(_describe_table(session, key)):
         if len(parts) == 1 and current_db and current_schema:
             resolved = _build_fqn(current_db, current_schema, parts[0])
@@ -995,23 +794,227 @@ def load_table_if_exists(session, table_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def build_missing_table_message(session, table_name: str) -> str:
-    context = get_session_context(session)
-    notes = st.session_state.setdefault("_table_resolution_notes", {})
-    note = notes.get(str(table_name), "")
+def append_text_field(df: pd.DataFrame, mask: pd.Series, column: str, value: str) -> None:
+    if not mask.any():
+        return
+    existing = df.loc[mask, column].fillna("").astype(str).str.strip()
+    updated = existing.where(existing == "", existing + "; " + value)
+    updated = updated.where(existing != "", value)
+    df.loc[mask, column] = updated
 
-    pieces = [f"Could not resolve table {table_name}."]
-    if context:
-        pieces.append(
-            "Session context: "
-            f"database={context.get('CURRENT_DATABASE') or '[none]'}, "
-            f"schema={context.get('CURRENT_SCHEMA') or '[none]'}, "
-            f"role={context.get('CURRENT_ROLE') or '[none]'}."
-        )
-    if note:
-        pieces.append(note)
-    pieces.append("Use a fully qualified table name or set TABLE_DATABASE / TABLE_SCHEMA at the top of the app.")
-    return " ".join(pieces)
+
+def append_rule(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
+    append_text_field(df, mask, "Rule Applied", rule_id)
+
+
+def append_note(df: pd.DataFrame, mask: pd.Series, note: str) -> None:
+    append_text_field(df, mask, "Analyst Notes", note)
+    if mask.any():
+        df.loc[mask, "Needs Review"] = True
+
+
+def set_action_key(df: pd.DataFrame, mask: pd.Series, action_key: str, rule_id: str | None = None) -> None:
+    if not mask.any():
+        return
+    df.loc[mask, "ACTION"] = display_action_from_key(action_key)
+    if rule_id:
+        append_rule(df, mask, rule_id)
+
+
+def set_if_stock_key(df: pd.DataFrame, mask: pd.Series, action_key: str, rule_id: str | None = None) -> None:
+    if not mask.any():
+        return
+    df.loc[mask, "If In Stock: Action"] = display_if_stock_from_key(action_key)
+    if rule_id:
+        append_rule(df, mask, rule_id)
+
+
+def set_buysmart_key(df: pd.DataFrame, mask: pd.Series, buy_key: str, rule_id: str | None = None) -> None:
+    if not mask.any():
+        return
+    df.loc[mask, "Buysmart Action"] = display_buysmart_from_key(buy_key)
+    if rule_id:
+        append_rule(df, mask, rule_id)
+
+
+def approve_with_stock_context(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
+    if not mask.any():
+        return
+
+    stock_context = df["upstream_action_key"].isin({"ON_MOG_CHECK_ATTRIBUTE", "CANNOT_ADD_NOT_IN_STOCK"})
+    preserve_mask = mask & stock_context
+    if preserve_mask.any():
+        df.loc[preserve_mask, "ACTION"] = df.loc[preserve_mask, "Upstream Action"]
+        df.loc[preserve_mask, "If In Stock: Action"] = "OK"
+        append_rule(df, preserve_mask, rule_id)
+
+    non_stock = mask & ~stock_context
+    one_time = non_stock & df["is_one_time"]
+    permanent = non_stock & ~df["is_one_time"]
+
+    if one_time.any():
+        set_action_key(df, one_time, "1X", rule_id)
+    if permanent.any():
+        set_action_key(df, permanent, "OK", rule_id)
+
+
+def deny_with_stock_context(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
+    if not mask.any():
+        return
+    cannot_add = mask & (df["upstream_action_key"] == "CANNOT_ADD_NOT_IN_STOCK")
+    on_mog = mask & (df["upstream_action_key"] == "ON_MOG_CHECK_ATTRIBUTE")
+    other = mask & ~(cannot_add | on_mog)
+
+    if cannot_add.any():
+        df.loc[cannot_add, "ACTION"] = df.loc[cannot_add, "Upstream Action"]
+        df.loc[cannot_add, "If In Stock: Action"] = "NO"
+        append_rule(df, cannot_add, rule_id)
+    if on_mog.any():
+        set_action_key(df, on_mog, "NO", rule_id)
+    if other.any():
+        set_action_key(df, other, "NO", rule_id)
+
+
+def prepare_upstream_fields(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Upstream Action" not in out.columns or out["Upstream Action"].fillna("").astype(str).str.strip().eq("").all():
+        out["Upstream Action"] = out["ACTION"]
+    if "Upstream If In Stock: Action" not in out.columns or out["Upstream If In Stock: Action"].fillna("").astype(str).str.strip().eq("").all():
+        out["Upstream If In Stock: Action"] = out["If In Stock: Action"]
+    if "Upstream Buysmart Action" not in out.columns or out["Upstream Buysmart Action"].fillna("").astype(str).str.strip().eq("").all():
+        out["Upstream Buysmart Action"] = out["Buysmart Action"]
+    return out
+
+def build_request_id(row: pd.Series, reporting_date: date, source_file_name: str = "", source_sheet_name: str = "") -> str:
+    existing = clean_text(row.get("workflow_request_id"))
+    if existing:
+        return existing
+
+    signature_parts = [
+        str(reporting_date),
+        source_file_name,
+        source_sheet_name,
+        clean_text(row.get("source_row_number")),
+        clean_text(row.get("Case#")),
+        clean_text(row.get("Business")),
+        clean_text(row.get("Type")),
+        clean_text(row.get("Vendor")),
+        clean_text(row.get("DIN")),
+        clean_text(row.get("MIN")),
+        clean_text(row.get("Description")),
+        clean_text(row.get("Unit Number")),
+        clean_text(row.get("Date Created")),
+    ]
+    signature = "|".join(signature_parts)
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, signature))
+
+
+def build_sample_workflow(reporting_date: date) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Business": ["Compass USA", "Compass Canada", "HealthTrust", "HMSHost"],
+            "Type": ["PRF", "Mass Adds", "SRF", "PRF"],
+            "Case#": ["WO0000001", pd.NA, "WO0000003", "WO0000004"],
+            "Date Created": pd.to_datetime([reporting_date] * 4),
+            "Sector": ["Morrison", "Chartwells Canada", "Acute Care", "Airport"],
+            "Division": ["Healthcare Division", "Schools Division", "HealthTrust", "HMSHost"],
+            "Unit Name": ["Unit A", "Unit B", "Unit C", "Unit D"],
+            "Unit Number": ["1001", "1002", "1003", "1004"],
+            "Vendor": ["Sysco Houston", "Sysco Vancouver", "US Foods Port Orange 3055 5Z", "Sysco Metro NY - Ritter"],
+            "Parent Category": ["Protein", "Disposables - Containers and Dinnerware", "Bakery & Dessert", "Beverages"],
+            "Sub Category": ["Chicken Breast Unbreaded Raw", "Smallwares", "Soup Frozen", "Soda"],
+            "DIN": ["111111", "222222", "333333", "444444"],
+            "MIN": ["MIN1", "MIN2", "MIN3", "MIN4"],
+            "Manufacturer": ["Great Lakes", "Diversey", "Chef Francisco", "Coca Cola Bottling Company"],
+            "Brand": ["Sysco", "Diversey", "Chef Francisco", "Coke"],
+            "Description": ["Chicken Breast Raw", "Disposable tray", "Frozen soup", "Soda fountain syrup"],
+            "Usage": [12, 4, 3, 8],
+            "One-Time or Permanent": ["Permanent", "Permanent", "One-Time", "Permanent"],
+            "Reason for request": ["Expand Program", "", "Patient need", ""],
+            "Buysmart Action": [pd.NA, pd.NA, pd.NA, pd.NA],
+            "Meets Criteria": [0.0, 0.0, 0.12, 0.0],
+            "In CAT": ["Y", "A", "Y", "N"],
+            "On MOG": [pd.NA, "SYSCO VANCOUVER - MMM", pd.NA, pd.NA],
+            "Pantry": [pd.NA, pd.NA, pd.NA, pd.NA],
+            "K12 APL": [pd.NA, "Y", pd.NA, pd.NA],
+            "Compass APL": [pd.NA, "Core APL", "S1", pd.NA],
+            "ACTION": ["On MOG. Check Attribute.", "On MOG. Check Attribute.", "", "Cannot Add. Not in Stock."],
+            "If In Stock: Action": [pd.NA, pd.NA, pd.NA, pd.NA],
+            "Conversion DIN": [pd.NA, pd.NA, pd.NA, pd.NA],
+            "Audit Action": [pd.NA, pd.NA, pd.NA, pd.NA],
+        }
+    )
+
+
+def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["Business"] = out["Business"].fillna("").astype(str).str.strip()
+    out["Type"] = out["Type"].fillna("").astype(str).str.strip()
+    out["Vendor"] = out["Vendor"].fillna("").astype(str).str.strip()
+    out["Brand"] = out["Brand"].fillna("").astype(str).str.strip()
+    out["Manufacturer"] = out["Manufacturer"].fillna("").astype(str).str.strip()
+    out["Description"] = out["Description"].fillna("").astype(str).str.strip()
+    out["Sub Category"] = out["Sub Category"].fillna("").astype(str).str.strip()
+    out["Parent Category"] = out["Parent Category"].fillna("").astype(str).str.strip()
+    out["Division"] = out["Division"].fillna("").astype(str).str.strip()
+    out["Sector"] = out["Sector"].fillna("").astype(str).str.strip()
+    out["Reason for request"] = out["Reason for request"].fillna("").astype(str).str.strip()
+    out["DIN"] = out["DIN"].fillna("").astype(str).str.strip()
+    out["MIN"] = out["MIN"].fillna("").astype(str).str.strip()
+    out["Usage"] = normalize_numeric(out["Usage"])
+    out["Date Created"] = normalize_date(out["Date Created"])
+    out["Meets Criteria"] = normalize_meets_criteria(out["Meets Criteria"])
+    out["One-Time or Permanent"] = out["One-Time or Permanent"].fillna("").astype(str).str.strip()
+
+    out["business_key"] = out["Business"].apply(normalize_business_key)
+    out["request_type_key"] = out["Type"].apply(normalize_request_type_key)
+    out["is_one_time"] = out["One-Time or Permanent"].str.lower().eq("one-time")
+    out["is_permanent"] = out["One-Time or Permanent"].str.lower().eq("permanent")
+    out["usage_num"] = out["Usage"].fillna(0)
+    out["meets_criteria_num"] = out["Meets Criteria"].fillna(0)
+    out["meets_criteria_ge_10"] = out["meets_criteria_num"] >= 0.10
+    out["in_cat_key"] = out["In CAT"].apply(normalize_in_cat_key)
+    out["is_in_cat_y"] = out["in_cat_key"].eq("Y")
+    out["is_temp_available"] = out["in_cat_key"].eq("TA")
+    out["is_in_catalog"] = out["in_cat_key"].isin(["Y", "A"])
+    out["is_pantry"] = out["Pantry"].fillna("").astype(str).str.strip().ne("")
+    out["is_k12_apl"] = out["K12 APL"].fillna("").astype(str).str.upper().eq("Y")
+    apl = out["Compass APL"].fillna("").astype(str)
+    out["is_core_apl"] = apl.str.contains("core apl", case=False, na=False)
+    out["is_s1"] = apl.str.contains("s1", case=False, na=False)
+    out["is_foh"] = apl.str.contains("foh", case=False, na=False)
+    out["is_diverse"] = apl.str.contains("diverse", case=False, na=False)
+    out["has_conversion"] = out["Conversion DIN"].fillna("").astype(str).str.strip().ne("")
+    out["upstream_action_key"] = out["Upstream Action"].apply(canonical_action_key)
+    out["upstream_if_stock_key"] = out["Upstream If In Stock: Action"].apply(canonical_action_key)
+    out["current_action_key"] = out["ACTION"].apply(canonical_action_key)
+    out["current_buysmart_key"] = out["Buysmart Action"].apply(normalize_buysmart_key)
+
+    out["brand_lc"] = out["Brand"].str.lower()
+    out["manufacturer_lc"] = out["Manufacturer"].str.lower()
+    out["description_lc"] = out["Description"].str.lower()
+    out["subcategory_lc"] = out["Sub Category"].str.lower()
+    out["parent_category_lc"] = out["Parent Category"].str.lower()
+    out["division_lc"] = out["Division"].str.lower()
+    out["sector_lc"] = out["Sector"].str.lower()
+    out["reason_lc"] = out["Reason for request"].str.lower()
+    out["vendor_lc"] = out["Vendor"].str.lower()
+    out["din_lc"] = out["DIN"].str.lower()
+    out["min_lc"] = out["MIN"].str.lower()
+
+    out["is_levy"] = out["division_lc"].str.contains("levy", na=False) | out["sector_lc"].str.contains("levy", na=False)
+    out["is_foodbuyone"] = out["business_key"].eq("FOODBUY_ONE")
+    out["is_hmshost"] = out["business_key"].eq("HMSHOST")
+    out["is_canada"] = out["business_key"].eq("CANADA")
+    out["is_healthtrust"] = out["business_key"].eq("HEALTHTRUST")
+    out["is_compass"] = out["business_key"].eq("COMPASS")
+    out["is_mass_add"] = out["request_type_key"].eq("MASS_ADD")
+    out["is_mass_srf"] = out["request_type_key"].eq("MASS_SRF")
+    out["is_prf"] = out["request_type_key"].eq("PRF")
+    out["is_sorf"] = out["request_type_key"].eq("SORF")
+    out["is_srf"] = out["request_type_key"].eq("SRF")
+
+    return out
 
 
 XLSX_NS = {
@@ -1259,238 +1262,6 @@ def load_workflow_sheet(uploaded_file) -> tuple[pd.DataFrame, str]:
     return workflow, sheet_name
 
 
-def append_text_field(df: pd.DataFrame, mask: pd.Series, column: str, value: str) -> None:
-    if not mask.any():
-        return
-    existing = df.loc[mask, column].fillna("").astype(str).str.strip()
-    updated = existing.where(existing == "", existing + "; " + value)
-    updated = updated.where(existing != "", value)
-    df.loc[mask, column] = updated
-
-
-def append_rule(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
-    append_text_field(df, mask, "Rule Applied", rule_id)
-
-
-def append_note(df: pd.DataFrame, mask: pd.Series, note: str) -> None:
-    append_text_field(df, mask, "Analyst Notes", note)
-    if mask.any():
-        df.loc[mask, "Needs Review"] = True
-
-
-def set_action_key(df: pd.DataFrame, mask: pd.Series, action_key: str, rule_id: str | None = None) -> None:
-    if not mask.any():
-        return
-    df.loc[mask, "ACTION"] = display_action_from_key(action_key)
-    if rule_id:
-        append_rule(df, mask, rule_id)
-
-
-def set_if_stock_key(df: pd.DataFrame, mask: pd.Series, action_key: str, rule_id: str | None = None) -> None:
-    if not mask.any():
-        return
-    df.loc[mask, "If In Stock: Action"] = display_if_stock_from_key(action_key)
-    if rule_id:
-        append_rule(df, mask, rule_id)
-
-
-def set_buysmart_key(df: pd.DataFrame, mask: pd.Series, buy_key: str, rule_id: str | None = None) -> None:
-    if not mask.any():
-        return
-    df.loc[mask, "Buysmart Action"] = display_buysmart_from_key(buy_key)
-    if rule_id:
-        append_rule(df, mask, rule_id)
-
-
-def approve_with_stock_context(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
-    if not mask.any():
-        return
-
-    stock_context = df["upstream_action_key"].isin({"ON_MOG_CHECK_ATTRIBUTE", "CANNOT_ADD_NOT_IN_STOCK"})
-    preserve_mask = mask & stock_context
-    if preserve_mask.any():
-        df.loc[preserve_mask, "ACTION"] = df.loc[preserve_mask, "Upstream Action"]
-        df.loc[preserve_mask, "If In Stock: Action"] = "OK"
-        append_rule(df, preserve_mask, rule_id)
-
-    non_stock = mask & ~stock_context
-    if (non_stock & df["is_one_time"]).any():
-        set_action_key(df, non_stock & df["is_one_time"], "1X", rule_id)
-    if (non_stock & ~df["is_one_time"]).any():
-        set_action_key(df, non_stock & ~df["is_one_time"], "OK", rule_id)
-
-
-def deny_with_stock_context(df: pd.DataFrame, mask: pd.Series, rule_id: str) -> None:
-    if not mask.any():
-        return
-    cannot_add = mask & (df["upstream_action_key"] == "CANNOT_ADD_NOT_IN_STOCK")
-    on_mog = mask & (df["upstream_action_key"] == "ON_MOG_CHECK_ATTRIBUTE")
-    other = mask & ~(cannot_add | on_mog)
-    if cannot_add.any():
-        df.loc[cannot_add, "ACTION"] = df.loc[cannot_add, "Upstream Action"]
-        df.loc[cannot_add, "If In Stock: Action"] = "NO"
-        append_rule(df, cannot_add, rule_id)
-    if on_mog.any():
-        set_action_key(df, on_mog, "NO", rule_id)
-    if other.any():
-        set_action_key(df, other, "NO", rule_id)
-
-
-def prepare_upstream_fields(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "Upstream Action" not in out.columns or out["Upstream Action"].fillna("").astype(str).str.strip().eq("").all():
-        out["Upstream Action"] = out["ACTION"]
-    if "Upstream If In Stock: Action" not in out.columns or out["Upstream If In Stock: Action"].fillna("").astype(str).str.strip().eq("").all():
-        out["Upstream If In Stock: Action"] = out["If In Stock: Action"]
-    if "Upstream Buysmart Action" not in out.columns or out["Upstream Buysmart Action"].fillna("").astype(str).str.strip().eq("").all():
-        out["Upstream Buysmart Action"] = out["Buysmart Action"]
-    return out
-
-
-def build_request_id(row: pd.Series, reporting_date: date, source_file_name: str = "", source_sheet_name: str = "") -> str:
-    existing = clean_text(row.get("workflow_request_id"))
-    if existing:
-        return existing
-    signature_parts = [
-        str(reporting_date),
-        source_file_name,
-        source_sheet_name,
-        clean_text(row.get("source_row_number")),
-        clean_text(row.get("Case#")),
-        clean_text(row.get("Business")),
-        clean_text(row.get("Type")),
-        clean_text(row.get("Vendor")),
-        clean_text(row.get("DIN")),
-        clean_text(row.get("MIN")),
-        clean_text(row.get("Description")),
-        clean_text(row.get("Unit Number")),
-        clean_text(row.get("Date Created")),
-    ]
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, "|".join(signature_parts)))
-
-
-def build_sample_workflow(reporting_date: date) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "Business": ["Compass USA", "Compass Canada", "HealthTrust", "HMSHost"],
-            "Type": ["PRF", "Mass Adds", "SRF", "PRF"],
-            "Case#": ["WO0000001", pd.NA, "WO0000003", "WO0000004"],
-            "Date Created": pd.to_datetime([reporting_date] * 4),
-            "Sector": ["Morrison", "Chartwells Canada", "Acute Care", "Airport"],
-            "Division": ["Healthcare Division", "Schools Division", "HealthTrust", "HMSHost"],
-            "Unit Name": ["Unit A", "Unit B", "Unit C", "Unit D"],
-            "Unit Number": ["1001", "1002", "1003", "1004"],
-            "Vendor": ["Sysco Houston", "Sysco Vancouver", "US Foods Port Orange 3055 5Z", "Sysco Metro NY - Ritter"],
-            "Parent Category": ["Protein", "Disposables - Containers and Dinnerware", "Bakery & Dessert", "Beverages"],
-            "Sub Category": ["Chicken Breast Unbreaded Raw", "Smallwares", "Soup Frozen", "Soda"],
-            "DIN": ["111111", "222222", "333333", "444444"],
-            "MIN": ["MIN1", "MIN2", "MIN3", "MIN4"],
-            "Manufacturer": ["Great Lakes", "Diversey", "Chef Francisco", "Coca Cola Bottling Company"],
-            "Brand": ["Sysco", "Diversey", "Chef Francisco", "Coke"],
-            "Description": ["Chicken Breast Raw", "Disposable tray", "Frozen soup", "Soda fountain syrup"],
-            "Usage": [12, 4, 3, 8],
-            "One-Time or Permanent": ["Permanent", "Permanent", "One-Time", "Permanent"],
-            "Reason for request": ["Expand Program", "", "Patient need", ""],
-            "Buysmart Action": [pd.NA, pd.NA, pd.NA, pd.NA],
-            "Meets Criteria": [0.0, 0.0, 0.12, 0.0],
-            "In CAT": ["Y", "A", "Y", "N"],
-            "On MOG": [pd.NA, "SYSCO VANCOUVER - MMM", pd.NA, pd.NA],
-            "Pantry": [pd.NA, pd.NA, pd.NA, pd.NA],
-            "K12 APL": [pd.NA, "Y", pd.NA, pd.NA],
-            "Compass APL": [pd.NA, "Core APL", "S1", pd.NA],
-            "ACTION": ["On MOG. Check Attribute.", "On MOG. Check Attribute.", "", "Cannot Add. Not in Stock."],
-            "If In Stock: Action": [pd.NA, pd.NA, pd.NA, pd.NA],
-            "Conversion DIN": [pd.NA, pd.NA, pd.NA, pd.NA],
-            "Audit Action": [pd.NA, pd.NA, pd.NA, pd.NA],
-        }
-    )
-
-
-def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    text_cols = [
-        "Business",
-        "Type",
-        "Vendor",
-        "Brand",
-        "Manufacturer",
-        "Description",
-        "Sub Category",
-        "Parent Category",
-        "Division",
-        "Sector",
-        "Reason for request",
-        "DIN",
-        "MIN",
-        "One-Time or Permanent",
-        "In CAT",
-        "Pantry",
-        "K12 APL",
-        "Compass APL",
-        "Conversion DIN",
-        "ACTION",
-        "If In Stock: Action",
-        "Buysmart Action",
-        "Upstream Action",
-        "Upstream If In Stock: Action",
-    ]
-    for col in text_cols:
-        if col in out.columns:
-            out[col] = out[col].fillna("").astype(str).str.strip()
-
-    out["Usage"] = normalize_numeric(out["Usage"])
-    out["Date Created"] = normalize_date(out["Date Created"])
-    out["Meets Criteria"] = normalize_meets_criteria(out["Meets Criteria"])
-
-    out["business_key"] = out["Business"].apply(normalize_business_key)
-    out["request_type_key"] = out["Type"].apply(normalize_request_type_key)
-    out["is_one_time"] = out["One-Time or Permanent"].str.lower().eq("one-time")
-    out["is_permanent"] = out["One-Time or Permanent"].str.lower().eq("permanent")
-    out["usage_num"] = out["Usage"].fillna(0)
-    out["meets_criteria_num"] = out["Meets Criteria"].fillna(0)
-    out["meets_criteria_ge_10"] = out["meets_criteria_num"] >= 0.10
-    out["in_cat_key"] = out["In CAT"].apply(normalize_in_cat_key)
-    out["is_in_cat_y"] = out["in_cat_key"].eq("Y")
-    out["is_in_catalog"] = out["in_cat_key"].isin(["Y", "A"])
-    out["is_pantry"] = out["Pantry"].ne("")
-    out["is_k12_apl"] = out["K12 APL"].str.upper().eq("Y")
-    apl = out["Compass APL"].fillna("").astype(str)
-    out["is_core_apl"] = apl.str.contains("core apl", case=False, na=False)
-    out["is_s1"] = apl.str.contains("s1", case=False, na=False)
-    out["is_foh"] = apl.str.contains("foh", case=False, na=False)
-    out["is_diverse"] = apl.str.contains("diverse", case=False, na=False)
-    out["has_conversion"] = out["Conversion DIN"].ne("")
-    out["upstream_action_key"] = out["Upstream Action"].apply(canonical_action_key)
-    out["upstream_if_stock_key"] = out["Upstream If In Stock: Action"].apply(canonical_action_key)
-    out["current_action_key"] = out["ACTION"].apply(canonical_action_key)
-    out["current_buysmart_key"] = out["Buysmart Action"].apply(normalize_buysmart_key)
-
-    out["brand_lc"] = out["Brand"].str.lower()
-    out["manufacturer_lc"] = out["Manufacturer"].str.lower()
-    out["description_lc"] = out["Description"].str.lower()
-    out["subcategory_lc"] = out["Sub Category"].str.lower()
-    out["parent_category_lc"] = out["Parent Category"].str.lower()
-    out["division_lc"] = out["Division"].str.lower()
-    out["sector_lc"] = out["Sector"].str.lower()
-    out["reason_lc"] = out["Reason for request"].str.lower()
-    out["vendor_lc"] = out["Vendor"].str.lower()
-    out["din_lc"] = out["DIN"].str.lower()
-    out["min_lc"] = out["MIN"].str.lower()
-
-    out["is_levy"] = out["division_lc"].str.contains("levy", na=False) | out["sector_lc"].str.contains("levy", na=False)
-    out["is_foodbuyone"] = out["business_key"].eq("FOODBUY_ONE")
-    out["is_hmshost"] = out["business_key"].eq("HMSHOST")
-    out["is_canada"] = out["business_key"].eq("CANADA")
-    out["is_healthtrust"] = out["business_key"].eq("HEALTHTRUST")
-    out["is_compass"] = out["business_key"].eq("COMPASS")
-    out["is_mass_add"] = out["request_type_key"].eq("MASS_ADD")
-    out["is_mass_srf"] = out["request_type_key"].eq("MASS_SRF")
-    out["is_prf"] = out["request_type_key"].eq("PRF")
-    out["is_sorf"] = out["request_type_key"].eq("SORF")
-    out["is_srf"] = out["request_type_key"].eq("SRF")
-    return out
-
-
 def load_reference_data(session) -> dict[str, object]:
     refs: dict[str, object] = {}
 
@@ -1512,7 +1283,9 @@ def load_reference_data(session) -> dict[str, object]:
     else:
         refs["lamb_weston_allowlist"] = {row["MIN"].lower() for row in DEFAULT_LAMB_WESTON_ALLOWLIST}
 
-    refs["rule_catalog"] = load_table_if_exists(session, TABLE_RULE_CATALOG)
+    rule_catalog_df = load_table_if_exists(session, TABLE_RULE_CATALOG)
+    refs["rule_catalog"] = rule_catalog_df
+
     return refs
 
 
@@ -1537,19 +1310,27 @@ def prepare_workflow_dataframe(
     workflow = collapse_duplicate_columns(workflow)
     workflow = prepare_upstream_fields(workflow)
 
-    workflow["Selected"] = coerce_bool_series(workflow["Selected"], default=False)
-    workflow["Excluded"] = coerce_bool_series(workflow["Excluded"], default=False)
-    workflow["Needs Review"] = coerce_bool_series(workflow["Needs Review"], default=False)
-    workflow["is_active"] = coerce_bool_series(workflow["is_active"], default=True)
+    workflow["Selected"] = workflow["Selected"].astype("boolean").fillna(False).astype(bool)
+    workflow["Excluded"] = workflow["Excluded"].astype("boolean").fillna(False).astype(bool)
+    workflow["Needs Review"] = workflow["Needs Review"].astype("boolean").fillna(False).astype(bool)
+    workflow["is_active"] = workflow["is_active"].astype("boolean").fillna(True).astype(bool)
 
     if batch_id is not None:
         workflow["batch_id"] = batch_id
+    elif "batch_id" not in workflow.columns:
+        workflow["batch_id"] = pd.NA
+
     if source_file_name is not None:
         workflow["source_file_name"] = source_file_name
+    elif "source_file_name" not in workflow.columns:
+        workflow["source_file_name"] = pd.NA
+
     if source_sheet_name is not None:
         workflow["source_sheet_name"] = source_sheet_name
+    elif "source_sheet_name" not in workflow.columns:
+        workflow["source_sheet_name"] = pd.NA
 
-    if workflow["source_row_number"].fillna("").astype(str).str.strip().eq("").all():
+    if workflow["source_row_number"].isna().all():
         workflow["source_row_number"] = range(1, len(workflow) + 1)
 
     workflow["reporting_date"] = pd.to_datetime(reporting_date).date()
@@ -1566,8 +1347,8 @@ def prepare_workflow_dataframe(
         for _, row in workflow.iterrows()
     ]
 
-    return add_derived_columns(workflow)
-
+    workflow = add_derived_columns(workflow)
+    return workflow
 
 def start_rule_run(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -1585,12 +1366,15 @@ def start_rule_run(df: pd.DataFrame) -> pd.DataFrame:
     out["Queue Bucket"] = ""
     out["Request Bucket"] = ""
     out["Outcome Reporting"] = ""
+    out["current_action_key"] = out["ACTION"].apply(canonical_action_key)
+    out["current_buysmart_key"] = ""
     return out
 
 
 def apply_preprocessing_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
     out = df.copy()
-    local_vendor_mask = out["vendor_lc"].isin(refs["local_vendors"])
+    local_vendors: set[str] = refs["local_vendors"]
+    local_vendor_mask = out["vendor_lc"].isin(local_vendors)
     if local_vendor_mask.any():
         out.loc[local_vendor_mask, "Excluded"] = True
         out.loc[local_vendor_mask, "Excluded Reason"] = "Local DC vendor"
@@ -1674,15 +1458,14 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
         if stock_ok_mask.any():
             append_rule(out, stock_ok_mask, "R-035")
 
-    low_usage_one_time = scope & ~has_conversion & out["is_one_time"] & ~(
+    one_time_non_apl = scope & ~has_conversion & out["is_one_time"] & ~(
         out["is_core_apl"] | out["is_s1"] | out["is_pantry"]
-    ) & (out["usage_num"] <= 10)
+    )
+    low_usage_one_time = one_time_non_apl & (out["usage_num"] <= 10)
     if low_usage_one_time.any():
         set_action_key(out, low_usage_one_time, "1X", "R-033")
 
-    high_usage_review = scope & ~has_conversion & out["is_one_time"] & ~(
-        out["is_core_apl"] | out["is_s1"] | out["is_pantry"]
-    ) & (out["usage_num"] > 10)
+    high_usage_review = one_time_non_apl & (out["usage_num"] > 10)
     if high_usage_review.any():
         append_note(out, high_usage_review, "Escalate Canada 1X > 10 cases to Betty MacDonald / Joy Pereira.")
         append_rule(out, high_usage_review, "R-034")
@@ -1695,7 +1478,6 @@ def apply_canada_rules(df: pd.DataFrame) -> pd.DataFrame:
 
     out["current_action_key"] = out["ACTION"].apply(canonical_action_key)
     return out
-
 
 def apply_healthtrust_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
     out = df.copy()
@@ -1890,7 +1672,6 @@ def apply_compass_prf_sorf_rules(df: pd.DataFrame, refs: dict[str, object]) -> p
 
     out["current_action_key"] = out["ACTION"].apply(canonical_action_key)
     return out
-
 
 def apply_compass_exception_overrides(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
     out = df.copy()
@@ -2089,29 +1870,6 @@ def run_validations(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def classify_outcome_reporting(row: pd.Series) -> str:
-    buy_smart = lower_text(row.get("Buysmart Action"))
-    action = lower_text(row.get("ACTION"))
-    needs_review = bool(row.get("Needs Review", False))
-    one_time = lower_text(row.get("One-Time or Permanent")) == "one-time"
-
-    if buy_smart == "denied" or action == "no":
-        return "denied"
-    if buy_smart == "approved" and one_time:
-        return "1x approved"
-    if buy_smart == "approved":
-        return "approved"
-    if "use right" in action or "use right" in buy_smart:
-        return "use right"
-    if "find alt" in action or "find alt" in buy_smart:
-        return "find alt first"
-    if "cdm" in action or "cdm" in buy_smart:
-        return "send/check with CDM"
-    if needs_review:
-        return "unresolved exceptions"
-    return "assigned"
-
-
 def finalize_derived_fields(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
@@ -2136,9 +1894,33 @@ def finalize_derived_fields(df: pd.DataFrame) -> pd.DataFrame:
     status = pd.Series("Ready", index=out.index)
     status = status.mask(out["Excluded"], "Excluded")
     status = status.mask(out["Needs Review"], "Needs Review")
-    current_status = out["Status"].fillna("").astype(str).str.strip()
-    out["Status"] = current_status.where(current_status.ne(""), status)
+    out["Status"] = out["Status"].fillna(status).replace("", pd.NA).fillna(status)
+
     return out
+
+
+def classify_outcome_reporting(row: pd.Series) -> str:
+    buy_smart = lower_text(row.get("Buysmart Action"))
+    action = lower_text(row.get("ACTION"))
+    in_stock_action = lower_text(row.get("If In Stock: Action"))
+    needs_review = bool(row.get("Needs Review", False))
+    one_time = lower_text(row.get("One-Time or Permanent")) == "one-time"
+
+    if buy_smart == "denied" or action == "no":
+        return "denied"
+    if buy_smart == "approved" and one_time:
+        return "1x approved"
+    if buy_smart == "approved":
+        return "approved"
+    if "use right" in action or "use right" in buy_smart:
+        return "use right"
+    if "find alt" in action or "find alt" in buy_smart:
+        return "find alt first"
+    if "cdm" in action or "cdm" in buy_smart:
+        return "send/check with CDM"
+    if needs_review:
+        return "unresolved exceptions"
+    return "assigned"
 
 
 def run_harvested_alpha_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.DataFrame:
@@ -2155,11 +1937,12 @@ def run_harvested_alpha_rules(df: pd.DataFrame, refs: dict[str, object]) -> pd.D
     out = derive_buysmart(out)
     out = run_validations(out)
     out = finalize_derived_fields(out)
-    return add_derived_columns(out)
-
+    out = add_derived_columns(out)
+    return out
 
 def ui_df_to_db_df(workflow_df: pd.DataFrame) -> pd.DataFrame:
     db_df = workflow_df.copy().rename(columns=UI_TO_DB)
+
     for ui_col, db_col in UI_TO_DB.items():
         if db_col not in db_df.columns and ui_col in workflow_df.columns:
             db_df[db_col] = workflow_df[ui_col]
@@ -2173,11 +1956,15 @@ def ui_df_to_db_df(workflow_df: pd.DataFrame) -> pd.DataFrame:
             db_df[ts_col] = pd.to_datetime(db_df[ts_col], errors="coerce")
     for bool_col in ["NEEDS_REVIEW", "EXCLUDED_FLAG", "SELECTED_FLAG", "IS_ACTIVE"]:
         if bool_col in db_df.columns:
-            db_df[bool_col] = coerce_bool_series(db_df[bool_col], default=False)
-    for numeric_col in ["USAGE_QTY", "MEETS_CRITERIA", "CONVERSION_VA_PCT"]:
-        if numeric_col in db_df.columns:
-            db_df[numeric_col] = pd.to_numeric(db_df[numeric_col], errors="coerce")
+            db_df[bool_col] = db_df[bool_col].fillna(False).astype(bool)
+    if "USAGE_QTY" in db_df.columns:
+        db_df["USAGE_QTY"] = pd.to_numeric(db_df["USAGE_QTY"], errors="coerce")
+    if "MEETS_CRITERIA" in db_df.columns:
+        db_df["MEETS_CRITERIA"] = pd.to_numeric(db_df["MEETS_CRITERIA"], errors="coerce")
+    if "CONVERSION_VA_PCT" in db_df.columns:
+        db_df["CONVERSION_VA_PCT"] = pd.to_numeric(db_df["CONVERSION_VA_PCT"], errors="coerce")
     return db_df
+
 
 
 def load_workflow_from_snowflake(session, reporting_date: date) -> pd.DataFrame:
@@ -2210,10 +1997,13 @@ def load_workflow_from_snowflake(session, reporting_date: date) -> pd.DataFrame:
 
     if df.empty:
         return df
+
     rename_map = {db_col: ui_col for db_col, ui_col in DB_TO_UI.items() if db_col in df.columns}
     df = df.rename(columns=rename_map)
+
     if "Analyst Notes" in df.columns and "Audit Action" not in df.columns:
         df["Audit Action"] = df["Analyst Notes"]
+
     return df
 
 
@@ -2232,6 +2022,7 @@ def merge_workflow_to_snowflake(session, workflow_df: pd.DataFrame) -> int:
         raise RuntimeError("No WORKFLOW_REQUEST_ID column found in prepared dataframe.")
 
     stage_table = f"TMP_CLAB_PROTO_WORKFLOW_{uuid.uuid4().hex.upper()}"
+
     session.write_pandas(
         db_df,
         stage_table,
@@ -2242,6 +2033,7 @@ def merge_workflow_to_snowflake(session, workflow_df: pd.DataFrame) -> int:
     )
 
     merge_cols = [c for c in db_df.columns if c != "WORKFLOW_REQUEST_ID"]
+
     update_assignments = [f"tgt.{col} = src.{col}" for col in merge_cols]
     if "UPDATED_BY" in target_cols:
         update_assignments.append("tgt.UPDATED_BY = current_user()")
@@ -2290,9 +2082,18 @@ def load_rule_catalog_summary(session) -> pd.DataFrame:
 
     automation = rule_catalog[cols["AUTOMATION_CANDIDATE"]].fillna("").astype(str).str.strip().str.lower()
     alpha = rule_catalog[cols["ALPHA_RECOMMENDATION"]].fillna("").astype(str).str.strip().str.lower()
+
     return pd.DataFrame(
         {
-            "Metric": RULE_SUMMARY_DEFAULT["Metric"],
+            "Metric": [
+                "Total harvested rules",
+                "Automation Candidate = Yes",
+                "Automation Candidate = Partial",
+                "Automation Candidate = No",
+                "Alpha Recommendation = Alpha",
+                "Alpha Recommendation = Guided",
+                "Alpha Recommendation = Future",
+            ],
             "Count": [
                 len(rule_catalog),
                 int((automation == "yes").sum()),
@@ -2328,12 +2129,9 @@ def sync_visible_editor_changes(full_df: pd.DataFrame, edited_visible_df: pd.Dat
             full_indexed.loc[edited_indexed.index, col] = edited_indexed[col]
 
     updated = full_indexed.reset_index(drop=True)
-    updated["Selected"] = coerce_bool_series(updated["Selected"], default=False)
-    updated["Excluded"] = coerce_bool_series(updated["Excluded"], default=False)
-    updated["Needs Review"] = coerce_bool_series(updated["Needs Review"], default=False)
     updated = add_derived_columns(updated)
-    return finalize_derived_fields(updated)
-
+    updated = finalize_derived_fields(updated)
+    return updated
 
 def initialize_workflow_state_from_table(session, reporting_date: date) -> pd.DataFrame:
     persisted = load_workflow_from_snowflake(session, reporting_date)
@@ -2349,6 +2147,193 @@ def initialize_workflow_state_from_table(session, reporting_date: date) -> pd.Da
     return draft
 
 
+
+WORKSPACE_OPTIONS = [
+    "Workflow Dashboard",
+    "Outcome Reporting",
+    "Rule Catalog",
+]
+
+WORKSPACE_META = {
+    "Workflow Dashboard": {
+        "nav": ":material/space_dashboard: Workflow",
+        "kicker": "Analyst operations surface",
+        "title": "Review the daily decision queue with clarity.",
+        "description": "Run harvested Alpha rules, focus the exception queue, and save analyst-ready outcomes back to Snowflake without drowning in columns.",
+    },
+    "Outcome Reporting": {
+        "nav": ":material/monitoring: Reporting",
+        "kicker": "Operating summary",
+        "title": "Turn the working set into a publish-ready rollup.",
+        "description": "See approved, denied, use-right, and unresolved outcomes in a cleaner operating view built for fast stakeholder review.",
+    },
+    "Rule Catalog": {
+        "nav": ":material/rule_settings: Catalog",
+        "kicker": "Automation inventory",
+        "title": "Inspect the harvested rule base with confidence.",
+        "description": "Measure automation coverage, browse rule details, and spot guided or future recommendations without leaving the app shell.",
+    },
+}
+
+QUEUE_LENS_OPTIONS = [
+    "All",
+    "Needs Review",
+    "Approved",
+    "Denied",
+    "Assigned",
+    "Excluded",
+]
+
+OUTCOME_LENS_OPTIONS = [
+    "All",
+    "Approved",
+    "Denied",
+    "Use Right / Alt",
+    "Needs Review",
+]
+
+WORKBENCH_COLUMNS = [
+    "Selected",
+    "Business",
+    "Type",
+    "Case#",
+    "Division",
+    "Vendor",
+    "Description",
+    "DIN",
+    "MIN",
+    "One-Time or Permanent",
+    "Meets Criteria",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Needs Review",
+    "Validation Status",
+    "Analyst Notes",
+    "Excluded",
+    "Excluded Reason",
+    "Assignment",
+    "Status",
+    "Rule Applied",
+    "Last Sync",
+    "Last Saved",
+]
+
+WORKBENCH_EDITABLE_COLUMNS = {
+    "Selected",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Needs Review",
+    "Validation Status",
+    "Analyst Notes",
+    "Excluded",
+    "Excluded Reason",
+    "Assignment",
+    "Status",
+}
+
+REVIEW_COLUMNS = [
+    "Business",
+    "Type",
+    "Case#",
+    "Division",
+    "Vendor",
+    "Description",
+    "ACTION",
+    "Buysmart Action",
+    "Needs Review",
+    "Validation Status",
+    "Analyst Notes",
+    "Rule Applied",
+    "Excluded",
+    "Excluded Reason",
+    "Status",
+]
+
+OUTCOME_DETAIL_COLUMNS = [
+    "Business",
+    "Type",
+    "Case#",
+    "Vendor",
+    "Description",
+    "One-Time or Permanent",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Request Bucket",
+    "Outcome Reporting",
+    "Needs Review",
+    "Validation Status",
+    "Analyst Notes",
+]
+
+KNOWN_ACTION_OPTIONS = [
+    "",
+    "OK",
+    "1X",
+    "NO",
+    "Use Right",
+    "Find Alt 1st",
+    "Check if use right is APL",
+    "Check with CDM",
+    "Send to CDM",
+    "Invalid Information",
+    "Produce MOG",
+    "Supply America",
+    "Buy Direct – United Restaurant Supplies and Equipment",
+    "HMSHost",
+    "HMS Host",
+    "In Stock – Add as PRF",
+    "Check for S1 alt, if there isn't one, please approve",
+    "On MOG. Check Attribute.",
+    "Cannot Add. Not in Stock.",
+]
+
+KNOWN_IF_STOCK_OPTIONS = ["", "OK", "NO", "HMSHost", "HMS Host"]
+KNOWN_BUYSMART_OPTIONS = ["", "Approved", "Denied", "Assigned"]
+KNOWN_STATUS_OPTIONS = ["Ready", "Needs Review", "Excluded"]
+
+WORKFLOW_SEARCH_COLUMNS = [
+    "Business",
+    "Type",
+    "Case#",
+    "Division",
+    "Sector",
+    "Vendor",
+    "Unit Name",
+    "Description",
+    "Manufacturer",
+    "Brand",
+    "Parent Category",
+    "Sub Category",
+    "DIN",
+    "MIN",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Rule Applied",
+    "Validation Status",
+    "Analyst Notes",
+    "Assignment",
+    "Status",
+]
+
+OUTCOME_SEARCH_COLUMNS = [
+    "Business",
+    "Type",
+    "Case#",
+    "Vendor",
+    "Description",
+    "ACTION",
+    "If In Stock: Action",
+    "Buysmart Action",
+    "Outcome Reporting",
+    "Analyst Notes",
+    "Validation Status",
+]
+
+
 def bootstrap_ui_state() -> None:
     defaults = {
         "app_view": "Workflow Dashboard",
@@ -2362,13 +2347,16 @@ def bootstrap_ui_state() -> None:
         "wf_buysmart": [],
         "wf_status": [],
         "wf_bucket": [],
+        "workflow_surface": "Workbench",
         "out_scope": "All",
         "out_search": "",
         "out_business": [],
         "out_type": [],
+        "outcome_surface": "Summary",
         "catalog_search": "",
         "catalog_auto": [],
         "catalog_alpha": [],
+        "catalog_surface": "Overview",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -2380,44 +2368,23 @@ def inject_global_styles() -> None:
         <style>
             :root {
                 --elite-ink: #0f172a;
-                --elite-muted: #475569;
-                --elite-subtle: #64748b;
-                --elite-card: rgba(255, 255, 255, 0.88);
-                --elite-line: rgba(15, 23, 42, 0.11);
+                --elite-subtle: #475569;
+                --elite-card: rgba(255, 255, 255, 0.84);
+                --elite-line: rgba(15, 23, 42, 0.10);
                 --elite-primary: #2859ff;
-                --elite-accent: #0f766e;
-                --elite-selected: #2563eb;
+                --elite-violet: #7c3aed;
+                --elite-shadow: 0 22px 60px rgba(15, 23, 42, 0.08);
                 --elite-control-bg: #ffffff;
-                --elite-control-soft: #f8fafc;
-                --elite-control-hover: #eff6ff;
-                --elite-control-selected-bg: #dbeafe;
                 --elite-control-border: rgba(15, 23, 42, 0.18);
-                --elite-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
-            }
-
-            html,
-            body,
-            [data-testid="stAppViewContainer"],
-            [data-testid="stSidebar"] {
-                color-scheme: light !important;
+                --elite-control-selected: #3b82f6;
             }
 
             [data-testid="stAppViewContainer"] {
                 background:
-                    radial-gradient(circle at top right, rgba(40, 89, 255, 0.10), transparent 25%),
+                    radial-gradient(circle at top right, rgba(40, 89, 255, 0.11), transparent 26%),
+                    radial-gradient(circle at top left, rgba(124, 58, 237, 0.10), transparent 24%),
                     linear-gradient(180deg, #f8fbff 0%, #f5f7fb 100%);
                 color: var(--elite-ink);
-            }
-
-            [data-testid="block-container"] {
-                max-width: 1680px;
-                padding-top: 2rem;
-                padding-bottom: 3rem;
-            }
-
-            [data-testid="stSidebar"] {
-                background: linear-gradient(180deg, #ffffff 0%, #f6f8fc 100%);
-                border-right: 1px solid var(--elite-line);
             }
 
             [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] p:not(.elite-hero p),
@@ -2429,23 +2396,77 @@ def inject_global_styles() -> None:
             [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] h5,
             [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] h6,
             [data-testid="stAppViewContainer"] label,
-            [data-testid="stAppViewContainer"] [data-testid="stWidgetLabel"] p {
+            [data-testid="stAppViewContainer"] [data-testid="stWidgetLabel"] p,
+            [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"] {
                 color: var(--elite-ink);
             }
 
-            [data-testid="stCaptionContainer"],
             [data-testid="stAppViewContainer"] [data-testid="stCaptionContainer"] {
-                color: var(--elite-muted);
+                color: var(--elite-subtle);
+            }
+
+            [data-testid="block-container"] {
+                max-width: 1680px;
+                padding-top: 2rem;
+                padding-bottom: 3rem;
+            }
+
+            [data-testid="stMetric"] {
+                background: var(--elite-card);
+                border: 1px solid var(--elite-line);
+                border-radius: 22px;
+                box-shadow: var(--elite-shadow);
+                padding: 1rem 1.15rem;
+                backdrop-filter: blur(8px);
+            }
+
+            div[data-testid="stMetricLabel"] p {
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                font-size: 0.74rem;
+                color: #64748b;
+                font-weight: 700;
+            }
+
+            div[data-testid="stMetricValue"] > div {
+                font-weight: 700;
+                color: var(--elite-ink);
+            }
+
+            div[data-testid="stMetricDelta"] {
+                color: var(--elite-subtle);
+            }
+
+            [data-testid="stTable"] table,
+            [data-testid="stTable"] th,
+            [data-testid="stTable"] td {
+                color: var(--elite-ink) !important;
+                background: rgba(255,255,255,0.76);
+            }
+
+            [data-testid="stTable"] th {
+                font-weight: 700;
+            }
+
+            [data-testid="stSidebar"] {
+                background: linear-gradient(180deg, #ffffff 0%, #f6f8fc 100%);
+                border-right: 1px solid var(--elite-line);
+            }
+
+            [data-testid="stAppViewContainer"] [data-testid="stVerticalBlockBorderWrapper"] {
+                background: rgba(255,255,255,0.52);
             }
 
             .elite-hero {
                 position: relative;
                 overflow: hidden;
-                padding: 1.65rem 1.8rem;
-                border-radius: 18px;
+                padding: 1.7rem 1.8rem;
+                border-radius: 30px;
                 color: #ffffff;
-                background: linear-gradient(135deg, #102a56 0%, #2859ff 58%, #0f766e 100%);
-                box-shadow: 0 24px 60px rgba(37, 99, 235, 0.20);
+                background:
+                    radial-gradient(circle at 15% 20%, rgba(255,255,255,0.22), transparent 22%),
+                    linear-gradient(135deg, #111827 0%, #1d4ed8 54%, #7c3aed 100%);
+                box-shadow: 0 30px 70px rgba(37, 99, 235, 0.26);
             }
 
             .elite-hero,
@@ -2457,28 +2478,31 @@ def inject_global_styles() -> None:
                 color: #ffffff !important;
             }
 
+            .elite-hero p {
+                color: rgba(255,255,255,0.90) !important;
+            }
+
             .elite-kicker {
-                margin-bottom: 0.65rem;
+                margin-bottom: 0.7rem;
                 font-size: 0.78rem;
-                letter-spacing: 0.14em;
+                letter-spacing: 0.16em;
                 text-transform: uppercase;
                 font-weight: 700;
-                opacity: 0.94;
+                opacity: 0.92;
             }
 
             .elite-hero h1 {
                 margin: 0 0 0.45rem 0;
-                font-size: 2.05rem;
-                line-height: 1.08;
-                letter-spacing: 0;
+                font-size: 2.15rem;
+                line-height: 1.05;
+                letter-spacing: -0.03em;
             }
 
             .elite-hero p {
                 margin: 0;
-                max-width: 68ch;
-                font-size: 1rem;
-                line-height: 1.58;
-                color: rgba(255,255,255,0.91) !important;
+                max-width: 64ch;
+                font-size: 1.02rem;
+                line-height: 1.6;
             }
 
             .elite-chip-row {
@@ -2492,11 +2516,11 @@ def inject_global_styles() -> None:
                 display: inline-flex;
                 align-items: center;
                 gap: 0.35rem;
-                border: 1px solid rgba(255,255,255,0.20);
+                border: 1px solid rgba(255,255,255,0.18);
                 background: rgba(255,255,255,0.14);
-                padding: 0.42rem 0.72rem;
+                padding: 0.45rem 0.75rem;
                 border-radius: 999px;
-                font-size: 0.85rem;
+                font-size: 0.86rem;
             }
 
             .elite-ribbon {
@@ -2519,9 +2543,9 @@ def inject_global_styles() -> None:
 
             .elite-empty {
                 padding: 1.35rem 1.2rem;
-                border-radius: 14px;
+                border-radius: 22px;
                 border: 1px dashed rgba(15,23,42,0.18);
-                background: rgba(255,255,255,0.72);
+                background: rgba(255,255,255,0.68);
             }
 
             .elite-empty h4 {
@@ -2532,33 +2556,8 @@ def inject_global_styles() -> None:
 
             .elite-empty p {
                 margin: 0;
-                color: var(--elite-muted);
-                line-height: 1.55;
-            }
-
-            [data-testid="stMetric"] {
-                background: var(--elite-card);
-                border: 1px solid var(--elite-line);
-                border-radius: 14px;
-                box-shadow: var(--elite-shadow);
-                padding: 1rem 1.15rem;
-            }
-
-            div[data-testid="stMetricLabel"] p {
-                letter-spacing: 0.06em;
-                text-transform: uppercase;
-                font-size: 0.74rem;
                 color: var(--elite-subtle);
-                font-weight: 700;
-            }
-
-            div[data-testid="stMetricValue"] > div {
-                font-weight: 700;
-                color: var(--elite-ink);
-            }
-
-            div[data-testid="stMetricDelta"] {
-                color: var(--elite-muted);
+                line-height: 1.55;
             }
 
             div.stButton > button,
@@ -2568,13 +2567,11 @@ def inject_global_styles() -> None:
             [data-testid="stExpander"] summary {
                 border-radius: 999px !important;
                 font-weight: 600 !important;
-                min-height: 2.6rem;
+                min-height: 2.75rem;
                 color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
                 background: rgba(255,255,255,0.98) !important;
                 border: 1px solid rgba(15,23,42,0.16) !important;
                 box-shadow: none !important;
-                opacity: 1 !important;
             }
 
             div.stButton > button *,
@@ -2583,204 +2580,30 @@ def inject_global_styles() -> None:
             [data-testid="stPopover"] > div > button *,
             [data-testid="stExpander"] summary * {
                 color: inherit !important;
-                -webkit-text-fill-color: inherit !important;
                 fill: currentColor !important;
                 stroke: currentColor !important;
             }
 
             div.stButton > button[kind="primary"],
             div.stDownloadButton > button[kind="primary"] {
-                background: linear-gradient(135deg, #2563eb 0%, #2859ff 100%) !important;
+                background: linear-gradient(135deg, #3b82f6 0%, #2859ff 100%) !important;
                 color: #ffffff !important;
-                -webkit-text-fill-color: #ffffff !important;
                 border: none !important;
             }
 
-            [data-testid="stTextInput"] input,
-            [data-testid="stDateInput"] input,
-            [data-testid="stNumberInput"] input,
-            [data-testid="stTextArea"] textarea,
-            [data-baseweb="input"] input,
-            [data-baseweb="textarea"] textarea {
-                background: var(--elite-control-bg) !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-                caret-color: var(--elite-primary) !important;
-                opacity: 1 !important;
-            }
-
-            [data-testid="stTextInput"] input::placeholder,
-            [data-testid="stDateInput"] input::placeholder,
-            [data-testid="stTextArea"] textarea::placeholder,
-            [data-baseweb="input"] input::placeholder {
-                color: #64748b !important;
-                -webkit-text-fill-color: #64748b !important;
-                opacity: 1 !important;
-            }
-
-            [data-testid="stTextInput"] [data-baseweb="input"],
-            [data-testid="stDateInput"] [data-baseweb="input"],
-            [data-testid="stNumberInput"] [data-baseweb="input"],
-            [data-testid="stTextArea"] [data-baseweb="textarea"],
-            [data-baseweb="select"] > div {
-                background: var(--elite-control-bg) !important;
-                border: 1px solid var(--elite-control-border) !important;
-                border-radius: 12px !important;
-                box-shadow: none !important;
-                color: var(--elite-ink) !important;
-                opacity: 1 !important;
-            }
-
-            [data-baseweb="select"],
-            [data-baseweb="select"] *,
-            [data-baseweb="tag"],
-            [data-baseweb="tag"] * {
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
+            div.stButton > button[kind="primary"] *,
+            div.stDownloadButton > button[kind="primary"] * {
+                color: #ffffff !important;
                 fill: currentColor !important;
                 stroke: currentColor !important;
             }
 
-            [data-baseweb="tag"] {
-                background: #e0f2fe !important;
-                border: 1px solid #bae6fd !important;
-            }
-
-            [data-testid="stSegmentedControl"],
-            [data-testid="stSegmentedControl"] > div,
-            [data-testid="stSegmentedControl"] [role="radiogroup"],
-            [data-testid="stSegmentedControl"] [data-baseweb="button-group"] {
-                background: transparent !important;
-                border: none !important;
-                box-shadow: none !important;
-                padding: 0 !important;
-                gap: 0.3rem !important;
-            }
-
-            [data-testid="stSegmentedControl"] [role="radiogroup"] {
-                display: flex !important;
-                flex-wrap: wrap !important;
-            }
-
-            [data-testid="stSegmentedControl"] label,
-            [data-testid="stSegmentedControl"] button,
-            [data-testid="stSegmentedControl"] [role="radio"],
-            [data-testid="stSegmentedControl"] [data-baseweb="radio"] {
-                min-height: 2.25rem !important;
-                border-radius: 999px !important;
-                border: 1px solid var(--elite-control-border) !important;
-                background: var(--elite-control-bg) !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-                box-shadow: none !important;
-                opacity: 1 !important;
-                filter: none !important;
-            }
-
-            [data-testid="stSegmentedControl"] label *,
-            [data-testid="stSegmentedControl"] button *,
-            [data-testid="stSegmentedControl"] [role="radio"] *,
-            [data-testid="stSegmentedControl"] [data-baseweb="radio"] * {
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-                fill: currentColor !important;
-                stroke: currentColor !important;
-                opacity: 1 !important;
-            }
-
-            [data-testid="stSegmentedControl"] label:hover,
-            [data-testid="stSegmentedControl"] button:hover,
-            [data-testid="stSegmentedControl"] [role="radio"]:hover,
-            [data-testid="stSegmentedControl"] [data-baseweb="radio"]:hover {
-                background: var(--elite-control-hover) !important;
-                border-color: rgba(37, 99, 235, 0.45) !important;
-            }
-
-            [data-testid="stSegmentedControl"] label:has(input:checked),
-            [data-testid="stSegmentedControl"] button[aria-pressed="true"],
-            [data-testid="stSegmentedControl"] button[aria-selected="true"],
-            [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"],
-            [data-testid="stSegmentedControl"] [data-baseweb="radio"][aria-checked="true"] {
-                background: var(--elite-control-selected-bg) !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-                border-color: var(--elite-selected) !important;
-                box-shadow: inset 0 0 0 1px var(--elite-selected) !important;
-            }
-
-            [data-baseweb="popover"],
-            [data-baseweb="popover"] *,
-            [data-baseweb="menu"],
-            [data-baseweb="menu"] *,
-            [data-baseweb="datepicker"],
-            [data-baseweb="datepicker"] *,
-            [data-baseweb="calendar"],
-            [data-baseweb="calendar"] *,
-            [role="listbox"],
-            [role="listbox"] *,
-            [role="menu"],
-            [role="menu"] * {
-                color-scheme: light !important;
-            }
-
-            [data-baseweb="popover"] > div,
-            [data-baseweb="menu"],
-            [data-baseweb="datepicker"],
-            [data-baseweb="calendar"],
-            [role="listbox"],
-            [role="menu"] {
-                background: #ffffff !important;
-                color: var(--elite-ink) !important;
-                border: 1px solid rgba(15, 23, 42, 0.14) !important;
-                border-radius: 12px !important;
-                box-shadow: 0 18px 42px rgba(15, 23, 42, 0.14) !important;
-            }
-
-            [role="option"],
-            [role="menuitem"],
-            [data-baseweb="menu"] li,
-            [data-baseweb="menu"] div {
-                background: #ffffff !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-            }
-
-            [role="option"]:hover,
-            [role="menuitem"]:hover,
-            [data-baseweb="menu"] li:hover {
-                background: var(--elite-control-hover) !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-            }
-
-            [role="option"][aria-selected="true"],
-            [role="option"][aria-checked="true"],
-            [role="menuitem"][aria-selected="true"],
-            [data-baseweb="menu"] li[aria-selected="true"] {
-                background: var(--elite-control-selected-bg) !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-            }
-
-            [data-baseweb="calendar"] button,
-            [data-baseweb="calendar"] [role="gridcell"],
-            [data-baseweb="datepicker"] button {
-                background: #ffffff !important;
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
-            }
-
-            [data-testid="stFileUploader"] section {
-                background: rgba(255,255,255,0.86) !important;
-                border: 1px dashed rgba(15,23,42,0.22) !important;
-                border-radius: 14px !important;
-                color: var(--elite-ink) !important;
-            }
-
-            [data-testid="stFileUploader"] section *,
-            [data-testid="stFileUploader"] label * {
-                color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
+            .stTextInput > div > div,
+            .stDateInput > div > div,
+            .stMultiSelect > div > div,
+            .stSelectbox > div > div,
+            .stTextArea textarea {
+                border-radius: 16px !important;
             }
 
             [data-testid="stTabs"] [data-baseweb="tab-list"] {
@@ -2792,50 +2615,125 @@ def inject_global_styles() -> None:
 
             [data-testid="stTabs"] [data-baseweb="tab"] {
                 border-radius: 999px;
-                padding: 0.58rem 0.9rem;
+                padding: 0.65rem 1rem;
                 border: 1px solid rgba(15,23,42,0.12) !important;
                 background: #ffffff !important;
                 color: var(--elite-ink) !important;
-                -webkit-text-fill-color: var(--elite-ink) !important;
             }
 
             [data-testid="stTabs"] [data-baseweb="tab"] *,
             [data-testid="stTabs"] [data-baseweb="tab"] svg,
             [data-testid="stTabs"] [data-baseweb="tab"] svg * {
                 color: inherit !important;
-                -webkit-text-fill-color: inherit !important;
                 fill: currentColor !important;
                 stroke: currentColor !important;
             }
 
             [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
-                background: var(--elite-control-selected-bg) !important;
-                border-color: var(--elite-selected) !important;
-                box-shadow: inset 0 0 0 1px var(--elite-selected) !important;
-            }
-
-            [data-testid="stTable"] table,
-            [data-testid="stTable"] th,
-            [data-testid="stTable"] td {
+                background: #ffffff !important;
                 color: var(--elite-ink) !important;
-                background: rgba(255,255,255,0.78) !important;
+                border-color: var(--elite-control-selected) !important;
+                box-shadow: inset 0 0 0 1px var(--elite-control-selected) !important;
             }
 
-            [data-testid="stTable"] th {
-                font-weight: 700;
+            /* Segmented controls: always white background + dark text, scoped by widget key. */
+            .st-key-app_view [data-testid="stSegmentedControl"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"],
+            .st-key-out_scope [data-testid="stSegmentedControl"],
+            .st-key-app_view [data-testid="stSegmentedControl"] > div,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] > div,
+            .st-key-out_scope [data-testid="stSegmentedControl"] > div,
+            .st-key-app_view [data-testid="stSegmentedControl"] div[role="radiogroup"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] div[role="radiogroup"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] div[role="radiogroup"],
+            .st-key-app_view [data-testid="stSegmentedControl"] div[data-baseweb="button-group"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] div[data-baseweb="button-group"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] div[data-baseweb="button-group"] {
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                padding: 0 !important;
+                gap: 0.25rem !important;
+            }
+
+            .st-key-app_view [data-testid="stSegmentedControl"] button,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button,
+            .st-key-out_scope [data-testid="stSegmentedControl"] button,
+            .st-key-app_view [data-testid="stSegmentedControl"] [role="radio"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] [role="radio"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] [role="radio"] {
+                background: var(--elite-control-bg) !important;
+                color: var(--elite-ink) !important;
+                -webkit-text-fill-color: var(--elite-ink) !important;
+                border: 1px solid var(--elite-control-border) !important;
+                box-shadow: none !important;
+                opacity: 1 !important;
+                filter: none !important;
+            }
+
+            .st-key-app_view [data-testid="stSegmentedControl"] button *,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button *,
+            .st-key-out_scope [data-testid="stSegmentedControl"] button *,
+            .st-key-app_view [data-testid="stSegmentedControl"] [role="radio"] *,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] [role="radio"] *,
+            .st-key-out_scope [data-testid="stSegmentedControl"] [role="radio"] * {
+                color: var(--elite-ink) !important;
+                fill: currentColor !important;
+                stroke: currentColor !important;
+                -webkit-text-fill-color: currentColor !important;
+                opacity: 1 !important;
+            }
+
+            .st-key-app_view [data-testid="stSegmentedControl"] button:hover,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button:hover,
+            .st-key-out_scope [data-testid="stSegmentedControl"] button:hover,
+            .st-key-app_view [data-testid="stSegmentedControl"] [role="radio"]:hover,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] [role="radio"]:hover,
+            .st-key-out_scope [data-testid="stSegmentedControl"] [role="radio"]:hover {
+                background: #ffffff !important;
+                color: var(--elite-ink) !important;
+                border-color: rgba(59, 130, 246, 0.45) !important;
+            }
+
+            .st-key-app_view [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+            .st-key-app_view [data-testid="stSegmentedControl"] button[aria-selected="true"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button[aria-selected="true"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] button[aria-selected="true"],
+            .st-key-app_view [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"],
+            .st-key-wf_scope [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"],
+            .st-key-out_scope [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] {
+                background: #ffffff !important;
+                color: var(--elite-ink) !important;
+                border-color: var(--elite-control-selected) !important;
+                box-shadow: inset 0 0 0 1px var(--elite-control-selected) !important;
+            }
+
+            .st-key-app_view [data-testid="stSegmentedControl"] button[aria-pressed="true"] *,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button[aria-pressed="true"] *,
+            .st-key-out_scope [data-testid="stSegmentedControl"] button[aria-pressed="true"] *,
+            .st-key-app_view [data-testid="stSegmentedControl"] button[aria-selected="true"] *,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] button[aria-selected="true"] *,
+            .st-key-out_scope [data-testid="stSegmentedControl"] button[aria-selected="true"] *,
+            .st-key-app_view [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] *,
+            .st-key-wf_scope [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] *,
+            .st-key-out_scope [data-testid="stSegmentedControl"] [role="radio"][aria-checked="true"] * {
+                color: var(--elite-ink) !important;
+                fill: currentColor !important;
+                stroke: currentColor !important;
+                -webkit-text-fill-color: currentColor !important;
             }
 
             [data-testid="stDataFrame"],
             [data-testid="stTable"] {
-                border-radius: 14px;
+                border-radius: 22px;
                 overflow: hidden;
-                border: 1px solid rgba(15, 23, 42, 0.10);
             }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 def push_notice(level: str, message: str) -> None:
     st.session_state["_app_notice"] = {"level": level, "message": message}
@@ -2845,6 +2743,7 @@ def render_notice() -> None:
     notice = st.session_state.pop("_app_notice", None)
     if not notice:
         return
+
     level = notice.get("level", "info")
     message = notice.get("message", "")
     if level == "success":
@@ -2865,6 +2764,7 @@ def display_scalar(value: object, fallback: str = "") -> str:
             return fallback
     except Exception:
         pass
+
     if isinstance(value, pd.Timestamp):
         return value.strftime("%b %d, %Y %I:%M %p")
     if isinstance(value, datetime):
@@ -2908,7 +2808,9 @@ def render_status_ribbon(items: Iterable[tuple[str, object]]) -> None:
         rendered = display_scalar(value)
         if not rendered:
             continue
-        chips.append(f"<span><strong>{html.escape(str(label))}</strong>&nbsp;{html.escape(rendered)}</span>")
+        chips.append(
+            f"<span><strong>{html.escape(str(label))}</strong>&nbsp;{html.escape(rendered)}</span>"
+        )
     if chips:
         st.markdown(f'<div class="elite-ribbon">{"".join(chips)}</div>', unsafe_allow_html=True)
 
@@ -2926,7 +2828,12 @@ def render_empty_state(title: str, body: str) -> None:
 
 
 def render_neutral_metric(container, label: str, value: object, delta: object, description: str) -> None:
-    container.metric(label, value, delta=delta, delta_color="off")
+    container.metric(
+        label,
+        value,
+        delta=delta,
+        delta_color="off",
+    )
     if description:
         container.caption(description)
 
@@ -2934,10 +2841,7 @@ def render_neutral_metric(container, label: str, value: object, delta: object, d
 def build_upload_state_key(uploaded_file, reporting_date: date) -> str:
     file_name = clean_text(getattr(uploaded_file, "name", "session-upload")) or "session-upload"
     try:
-        uploaded_file.seek(0)
-        data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-        uploaded_file.seek(0)
-        signature = hashlib.md5(data).hexdigest()
+        signature = hashlib.md5(_get_uploaded_file_bytes(uploaded_file)).hexdigest()
     except Exception:
         signature = file_name
     return f"upload::{file_name}::{signature}::{reporting_date.isoformat()}"
@@ -2967,6 +2871,7 @@ def ensure_workflow_source_loaded(session, reporting_date: date, uploaded_file) 
     if st.session_state.get("workflow_source_key") != table_source_key or "workflow_drafts" not in st.session_state:
         initialize_workflow_state_from_table(session, reporting_date)
         st.session_state.workflow_source_key = table_source_key
+
     return st.session_state.workflow_drafts.copy()
 
 
@@ -2989,33 +2894,19 @@ def build_search_mask(df: pd.DataFrame, columns: Iterable[str], query: str) -> p
 def build_rollup(series: pd.Series, label: str, order: list[str] | None = None, fallback: str = "Unspecified") -> pd.DataFrame:
     values = series.fillna(fallback).astype(str).replace("", fallback)
     counts = values.value_counts()
+
     if order:
         combined_order = list(dict.fromkeys([*order, *counts.index.tolist()]))
         counts = counts.reindex(combined_order, fill_value=0)
+
     return counts.rename_axis(label).reset_index(name="Rows")
 
 
-def polish_chart(chart: alt.Chart) -> alt.Chart:
-    return (
-        chart.configure(background="#ffffff")
-        .configure_view(fill="#ffffff", stroke="#e2e8f0")
-        .configure_axis(
-            labelColor="#0f172a",
-            titleColor="#334155",
-            gridColor="#e2e8f0",
-            domainColor="#cbd5e1",
-            tickColor="#cbd5e1",
-        )
-        .configure_title(color="#0f172a", fontSize=15, fontWeight=700, anchor="start")
-        .configure_legend(labelColor="#0f172a", titleColor="#0f172a", orient="right")
-    )
-
-
 def make_horizontal_bar_chart(df: pd.DataFrame, category_col: str, value_col: str, title: str, order: list[str] | None = None) -> alt.Chart:
-    chart_height = max(240, min(560, 28 * max(len(df), 1) + 40))
-    chart = (
+    chart_height = max(220, min(560, 28 * max(len(df), 1) + 30))
+    return (
         alt.Chart(df)
-        .mark_bar(cornerRadiusEnd=8, color="#2859ff")
+        .mark_bar(cornerRadiusEnd=10, color="#2859ff")
         .encode(
             x=alt.X(f"{value_col}:Q", title="Rows"),
             y=alt.Y(f"{category_col}:N", sort=order if order else "-x", title=None),
@@ -3023,13 +2914,12 @@ def make_horizontal_bar_chart(df: pd.DataFrame, category_col: str, value_col: st
         )
         .properties(title=title, height=chart_height)
     )
-    return polish_chart(chart)
 
 
 def make_vertical_bar_chart(df: pd.DataFrame, category_col: str, value_col: str, title: str) -> alt.Chart:
-    chart = (
+    return (
         alt.Chart(df)
-        .mark_bar(cornerRadiusTopLeft=8, cornerRadiusTopRight=8, color="#0f766e")
+        .mark_bar(cornerRadiusTopLeft=10, cornerRadiusTopRight=10, color="#7c3aed")
         .encode(
             x=alt.X(f"{category_col}:N", sort="-y", title=None, axis=alt.Axis(labelAngle=-20)),
             y=alt.Y(f"{value_col}:Q", title="Rows"),
@@ -3037,29 +2927,22 @@ def make_vertical_bar_chart(df: pd.DataFrame, category_col: str, value_col: str,
         )
         .properties(title=title, height=320)
     )
-    return polish_chart(chart)
 
 
 def make_donut_chart(df: pd.DataFrame, category_col: str, value_col: str, title: str) -> alt.Chart:
-    chart = (
-        alt.Chart(df)
-        .mark_arc(innerRadius=70, outerRadius=118)
-        .encode(
-            theta=alt.Theta(f"{value_col}:Q"),
-            color=alt.Color(
-                f"{category_col}:N",
-                legend=alt.Legend(title=None),
-                scale=alt.Scale(range=["#2859ff", "#0f766e", "#f59e0b", "#dc2626", "#7c3aed", "#0891b2", "#64748b", "#db2777"]),
-            ),
-            tooltip=[alt.Tooltip(f"{category_col}:N", title=category_col), alt.Tooltip(f"{value_col}:Q", format=",")],
-        )
-        .properties(title=title, height=320)
+    base = alt.Chart(df).encode(
+        theta=alt.Theta(f"{value_col}:Q"),
+        color=alt.Color(f"{category_col}:N", legend=alt.Legend(title=None)),
+        tooltip=[alt.Tooltip(f"{category_col}:N", title=category_col), alt.Tooltip(f"{value_col}:Q", format=",")],
     )
-    return polish_chart(chart)
+    return base.mark_arc(innerRadius=70, outerRadius=118).properties(title=title, height=320)
 
 
-def render_pair_table(pairs: list[tuple[str, object]]) -> None:
-    rows = [{"Field": label, "Value": display_scalar(value, fallback="-") or "-"} for label, value in pairs]
+def render_pair_table(pairs: list[tuple[str, object]], *, height: int | str = "content") -> None:
+    rows = [
+        {"Field": label, "Value": display_scalar(value, fallback="—") or "—"}
+        for label, value in pairs
+    ]
     st.table(pd.DataFrame(rows))
 
 
@@ -3067,38 +2950,50 @@ def render_shell(session) -> tuple[str, date, object]:
     hero_col, command_col = st.columns([1.65, 1.0], gap="large", vertical_alignment="top")
 
     with command_col:
-        st.markdown("##### Command deck")
-        st.caption("Switch workspace, lock the reporting date, and optionally override Snowflake with a session workbook.")
+        with st.container():
+            st.markdown("##### Command deck")
+            st.caption("Switch workspace, lock the reporting date, and optionally override Snowflake with a session workbook.")
 
-        app_view = st.segmented_control(
-            "Workspace",
-            options=WORKSPACE_OPTIONS,
-            format_func=lambda option: WORKSPACE_META[option]["nav"],
-            key="app_view",
-            width="stretch",
-        )
-        app_view = app_view or "Workflow Dashboard"
-
-        reporting_date = st.date_input("Reporting as of", key="reporting_date")
-        if isinstance(reporting_date, tuple):
-            reporting_date = reporting_date[0]
-        reporting_date = reporting_date or datetime.now().date()
-
-        with st.expander("Session workbook override", expanded=False):
-            uploaded_file = st.file_uploader(
-                "Upload daily PRF / SORF / SRF workbook",
-                type=["xlsx"],
-                key="session_workbook",
-                help="When a workbook is loaded, it becomes the active working set for this browser session.",
+            app_view = st.segmented_control(
+                "Workspace",
+                options=WORKSPACE_OPTIONS,
+                format_func=lambda option: WORKSPACE_META[option]["nav"],
+                key="app_view",
+                width="stretch",
             )
-            if uploaded_file is not None:
-                st.success(f"{uploaded_file.name} is active for this session.")
-            else:
-                st.caption("No workbook override is active. Warehouse-backed rows are used for the selected date.")
+            if app_view is None:
+                app_view = "Workflow Dashboard"
+
+            reporting_date = st.date_input(
+                "Reporting as of",
+                key="reporting_date",
+            )
+            if isinstance(reporting_date, tuple):
+                reporting_date = reporting_date[0]
+            if reporting_date is None:
+                reporting_date = datetime.now().date()
+
+            upload_expander = st.expander(
+                "Session workbook override",
+                expanded=False,
+            )
+            with upload_expander:
+                uploaded_file = st.file_uploader(
+                    "Upload daily PRF / SORF / SRF workbook",
+                    type=["xlsx"],
+                    key="session_workbook",
+                    help="When a workbook is loaded, it becomes the active working set for this browser session.",
+                )
+                if uploaded_file is not None:
+                    st.success(f"{uploaded_file.name} is active for this session.")
+                else:
+                    st.caption("No workbook override is active. Warehouse-backed rows are used for the selected date.")
+
+            st.caption("Filters in the redesigned work surfaces can be bound to the URL for shareable views.")
 
     with hero_col:
-        meta = WORKSPACE_META.get(app_view, WORKSPACE_META["Workflow Dashboard"])
-        source_chip = f"Workbook override: {clean_text(getattr(uploaded_file, 'name', ''))}" if uploaded_file is not None else "Snowflake-backed working set"
+        meta = WORKSPACE_META.get(app_view or "Workflow Dashboard", WORKSPACE_META["Workflow Dashboard"])
+        source_chip = f"Workbook override · {clean_text(getattr(uploaded_file, 'name', ''))}" if uploaded_file is not None else "Snowflake-backed working set"
         st.markdown(
             f"""
             <div class="elite-hero">
@@ -3106,9 +3001,9 @@ def render_shell(session) -> tuple[str, date, object]:
                 <h1>{html.escape(meta['title'])}</h1>
                 <p>{html.escape(meta['description'])}</p>
                 <div class="elite-chip-row">
-                    <span class="elite-chip">Report date: {html.escape(display_scalar(reporting_date))}</span>
+                    <span class="elite-chip">Report date · {html.escape(display_scalar(reporting_date))}</span>
                     <span class="elite-chip">{html.escape(source_chip)}</span>
-                    <span class="elite-chip">Light theme controls</span>
+                    <span class="elite-chip">Shareable URL state</span>
                 </div>
             </div>
             """,
@@ -3121,12 +3016,12 @@ def render_shell(session) -> tuple[str, date, object]:
 def render_sidebar(session, reporting_date: date, uploaded_file) -> None:
     with st.sidebar:
         st.markdown("### Workspace guide")
-        st.caption("The rule engine and Snowflake contract stay intact while the work surface stays readable.")
+        st.caption("This build keeps the original rule engine and Snowflake contract intact while simplifying the operating surface.")
         st.markdown(
             """
-            **Workflow Dashboard** - run deterministic rules, edit decisions, and save.  
-            **Outcome Reporting** - produce a cleaner outcome summary.  
-            **Rule Catalog** - inspect automation coverage and harvested rules.
+            **Workflow Dashboard** — run deterministic rules, edit decisions, and save.  
+            **Outcome Reporting** — produce a cleaner outcome summary.  
+            **Rule Catalog** — inspect automation coverage and harvested rules.
             """
         )
         render_status_ribbon(
@@ -3136,41 +3031,56 @@ def render_sidebar(session, reporting_date: date, uploaded_file) -> None:
             ]
         )
 
-        with st.expander("Snowflake session", expanded=False):
-            st.write(get_session_context(session) or {"status": "Unavailable"})
-            st.write(
-                {
-                    "workflow_table": resolve_table_name(session, TABLE_WORKFLOW) or "[not resolved]",
-                    "rule_catalog": resolve_table_name(session, TABLE_RULE_CATALOG) or "[not resolved]",
-                    "local_vendor": resolve_table_name(session, TABLE_LOCAL_VENDOR) or "[not resolved]",
-                    "disallowed_min": resolve_table_name(session, TABLE_DISALLOWED_MIN) or "[not resolved]",
-                    "allowlist": resolve_table_name(session, TABLE_ALLOWLIST) or "[not resolved]",
-                }
-            )
+        context_expander = st.expander(
+            "Snowflake session",
+            expanded=False,
+        )
+        with context_expander:
+            if True:
+                st.write(get_session_context(session) or {"status": "Unavailable"})
+                st.write(
+                    {
+                        "workflow_table": resolve_table_name(session, TABLE_WORKFLOW) or "[not resolved]",
+                        "rule_catalog": resolve_table_name(session, TABLE_RULE_CATALOG) or "[not resolved]",
+                        "local_vendor": resolve_table_name(session, TABLE_LOCAL_VENDOR) or "[not resolved]",
+                        "disallowed_min": resolve_table_name(session, TABLE_DISALLOWED_MIN) or "[not resolved]",
+                        "allowlist": resolve_table_name(session, TABLE_ALLOWLIST) or "[not resolved]",
+                    }
+                )
 
 
 def reset_workflow_filters() -> None:
-    st.session_state.update(
-        {
-            "wf_scope": "All",
-            "wf_hide_excluded": True,
-            "wf_only_selected": False,
-            "wf_search": "",
-            "wf_business": [],
-            "wf_type": [],
-            "wf_buysmart": [],
-            "wf_status": [],
-            "wf_bucket": [],
-        }
-    )
+    defaults = {
+        "wf_scope": "All",
+        "wf_hide_excluded": True,
+        "wf_only_selected": False,
+        "wf_search": "",
+        "wf_business": [],
+        "wf_type": [],
+        "wf_buysmart": [],
+        "wf_status": [],
+        "wf_bucket": [],
+    }
+    st.session_state.update(defaults)
 
 
 def reset_outcome_filters() -> None:
-    st.session_state.update({"out_scope": "All", "out_search": "", "out_business": [], "out_type": []})
+    defaults = {
+        "out_scope": "All",
+        "out_search": "",
+        "out_business": [],
+        "out_type": [],
+    }
+    st.session_state.update(defaults)
 
 
 def reset_catalog_filters() -> None:
-    st.session_state.update({"catalog_search": "", "catalog_auto": [], "catalog_alpha": []})
+    defaults = {
+        "catalog_search": "",
+        "catalog_auto": [],
+        "catalog_alpha": [],
+    }
+    st.session_state.update(defaults)
 
 
 def build_workflow_filter_mask(df: pd.DataFrame) -> pd.Series:
@@ -3190,19 +3100,29 @@ def build_workflow_filter_mask(df: pd.DataFrame) -> pd.Series:
 
     if scope != "Excluded" and st.session_state.get("wf_hide_excluded", True):
         mask &= ~df["Excluded"].fillna(False)
+
     if st.session_state.get("wf_only_selected", False):
         mask &= df["Selected"].fillna(False)
 
-    for state_key, column in [
-        ("wf_business", "Business"),
-        ("wf_type", "Type"),
-        ("wf_buysmart", "Buysmart Action"),
-        ("wf_status", "Status"),
-        ("wf_bucket", "Request Bucket"),
-    ]:
-        values = st.session_state.get(state_key, [])
-        if values:
-            mask &= df[column].fillna("").isin(values)
+    business_filter = st.session_state.get("wf_business", [])
+    if business_filter:
+        mask &= df["Business"].fillna("").isin(business_filter)
+
+    type_filter = st.session_state.get("wf_type", [])
+    if type_filter:
+        mask &= df["Type"].fillna("").isin(type_filter)
+
+    buysmart_filter = st.session_state.get("wf_buysmart", [])
+    if buysmart_filter:
+        mask &= df["Buysmart Action"].fillna("").isin(buysmart_filter)
+
+    status_filter = st.session_state.get("wf_status", [])
+    if status_filter:
+        mask &= df["Status"].fillna("").isin(status_filter)
+
+    bucket_filter = st.session_state.get("wf_bucket", [])
+    if bucket_filter:
+        mask &= df["Request Bucket"].fillna("").isin(bucket_filter)
 
     mask &= build_search_mask(df, WORKFLOW_SEARCH_COLUMNS, st.session_state.get("wf_search", ""))
     return mask
@@ -3212,21 +3132,56 @@ def render_workflow_filter_bar(df: pd.DataFrame) -> pd.DataFrame:
     search_col, lens_col, filter_col = st.columns([1.55, 1.15, 1.0], gap="small", vertical_alignment="bottom")
 
     with search_col:
-        st.text_input("Search", placeholder="Case, vendor, description, DIN, MIN, notes...", key="wf_search")
+        st.text_input(
+            "Search",
+            placeholder="Case, vendor, description, DIN, MIN, notes…",
+            key="wf_search",
+        )
 
     with lens_col:
-        st.segmented_control("Queue lens", options=QUEUE_LENS_OPTIONS, key="wf_scope", width="stretch")
+        st.segmented_control(
+            "Queue lens",
+            options=QUEUE_LENS_OPTIONS,
+            key="wf_scope",
+            width="stretch",
+        )
 
     with filter_col:
-        with st.popover("Advanced filters"):
+        with st.popover(
+            "Advanced filters",
+        ):
             st.toggle("Hide excluded", key="wf_hide_excluded")
             st.toggle("Only selected", key="wf_only_selected")
-            st.multiselect("Business", options=sorted(v for v in df["Business"].dropna().astype(str).unique() if v), key="wf_business")
-            st.multiselect("Request type", options=sorted(v for v in df["Type"].dropna().astype(str).unique() if v), key="wf_type")
-            st.multiselect("BuySmart action", options=ordered_unique_strings(KNOWN_BUYSMART_OPTIONS, df["Buysmart Action"].dropna().astype(str).tolist()), key="wf_buysmart")
-            st.multiselect("Status", options=ordered_unique_strings(KNOWN_STATUS_OPTIONS, df["Status"].dropna().astype(str).tolist()), key="wf_status")
-            st.multiselect("Request bucket", options=ordered_unique_strings(REQUEST_BUCKET_ORDER, df["Request Bucket"].dropna().astype(str).tolist()), key="wf_bucket")
-            st.button("Reset filters", on_click=reset_workflow_filters)
+            st.multiselect(
+                "Business",
+                options=sorted(v for v in df["Business"].dropna().astype(str).unique() if v),
+                key="wf_business",
+            )
+            st.multiselect(
+                "Request type",
+                options=sorted(v for v in df["Type"].dropna().astype(str).unique() if v),
+                key="wf_type",
+            )
+            st.multiselect(
+                "BuySmart action",
+                options=ordered_unique_strings(KNOWN_BUYSMART_OPTIONS, df["Buysmart Action"].dropna().astype(str).tolist()),
+                key="wf_buysmart",
+            )
+            st.multiselect(
+                "Status",
+                options=ordered_unique_strings(KNOWN_STATUS_OPTIONS, df["Status"].dropna().astype(str).tolist()),
+                key="wf_status",
+            )
+            st.multiselect(
+                "Request bucket",
+                options=ordered_unique_strings(REQUEST_BUCKET_ORDER, df["Request Bucket"].dropna().astype(str).tolist()),
+                key="wf_bucket",
+            )
+            st.button(
+                "Reset filters",
+                on_click=reset_workflow_filters,
+            )
+            
 
     filtered_df = df.loc[build_workflow_filter_mask(df)].copy()
     render_status_ribbon(
@@ -3248,7 +3203,9 @@ def render_workflow_overview_metrics(full_df: pd.DataFrame, visible_df: pd.DataF
     approved_rows = int(full_df["Buysmart Action"].fillna("").astype(str).str.lower().eq("approved").sum())
     denied_rows = int(full_df["Buysmart Action"].fillna("").astype(str).str.lower().eq("denied").sum())
     assigned_rows = int(full_df["Buysmart Action"].fillna("").astype(str).str.lower().isin(["assigned", ""]).sum())
-    pct = lambda value: f"{(value / total_rows):.0%}" if total_rows else "0%"
+
+    def pct(value: int) -> str:
+        return f"{(value / total_rows):.0%}" if total_rows else "0%"
 
     metric_cols = st.columns(6, gap="small")
     render_neutral_metric(metric_cols[0], "Working set", f"{total_rows:,}", f"{visible_rows:,}", "visible after filters")
@@ -3264,6 +3221,7 @@ def build_editor_column_config(df: pd.DataFrame) -> dict[str, object]:
     if_stock_options = ordered_unique_strings(KNOWN_IF_STOCK_OPTIONS, df["If In Stock: Action"].dropna().astype(str).tolist())
     buysmart_options = ordered_unique_strings(KNOWN_BUYSMART_OPTIONS, df["Buysmart Action"].dropna().astype(str).tolist())
     status_options = ordered_unique_strings(KNOWN_STATUS_OPTIONS, df["Status"].dropna().astype(str).tolist())
+
     return {
         "Selected": st.column_config.CheckboxColumn("Focus", help="Pin rows to the focused review panel."),
         "Business": st.column_config.TextColumn("Business", width="small"),
@@ -3294,18 +3252,35 @@ def build_editor_column_config(df: pd.DataFrame) -> dict[str, object]:
 
 def render_selected_rows_panel(workflow_df: pd.DataFrame) -> None:
     selected_df = workflow_df[workflow_df["Selected"].fillna(False)].copy()
-    with st.expander("Focused record review", expanded=bool(len(selected_df))):
+
+    review_panel = st.expander(
+        "Focused record review",
+        expanded=bool(len(selected_df)),
+    )
+    with review_panel:
         if selected_df.empty:
             render_empty_state(
                 "No focused rows yet",
-                "Use the Focus checkbox in the workbench to pin one or more rows here for deeper review.",
+                "Use the Focus checkbox in the workbench to pin one or more rows here for deeper review, rule traceability, and context.",
             )
             return
 
         if len(selected_df) > 1:
             st.caption(f"{len(selected_df):,} rows are currently focused.")
             st.dataframe(
-                selected_df[["Business", "Type", "Case#", "Vendor", "Description", "ACTION", "Buysmart Action", "Needs Review", "Status"]],
+                selected_df[
+                    [
+                        "Business",
+                        "Type",
+                        "Case#",
+                        "Vendor",
+                        "Description",
+                        "ACTION",
+                        "Buysmart Action",
+                        "Needs Review",
+                        "Status",
+                    ]
+                ],
                 use_container_width=True,
                 hide_index=True,
                 height=320,
@@ -3316,7 +3291,7 @@ def render_selected_rows_panel(workflow_df: pd.DataFrame) -> None:
         title = clean_text(row.get("Description")) or "Selected request"
         subtitle_parts = [clean_text(row.get("Business")), clean_text(row.get("Type")), clean_text(row.get("Case#"))]
         st.markdown(f"##### {title}")
-        st.caption(" | ".join(part for part in subtitle_parts if part))
+        st.caption(" · ".join(part for part in subtitle_parts if part))
         render_status_ribbon(
             [
                 ("Action", row.get("ACTION")),
@@ -3328,7 +3303,6 @@ def render_selected_rows_panel(workflow_df: pd.DataFrame) -> None:
 
         left, right = st.columns([1.05, 0.95], gap="large")
         with left:
-            meets_criteria = pd.to_numeric(pd.Series([row.get("Meets Criteria")]), errors="coerce").iloc[0]
             render_pair_table(
                 [
                     ("Vendor", row.get("Vendor")),
@@ -3342,9 +3316,10 @@ def render_selected_rows_panel(workflow_df: pd.DataFrame) -> None:
                     ("Parent Category", row.get("Parent Category")),
                     ("Sub Category", row.get("Sub Category")),
                     ("Request term", row.get("One-Time or Permanent")),
-                    ("Meets Criteria", f"{meets_criteria:.1%}" if pd.notna(meets_criteria) else "-"),
+                    ("Meets Criteria", f"{float(row.get('Meets Criteria') or 0):.1%}" if pd.notna(row.get("Meets Criteria")) else "—"),
                 ]
             )
+
         with right:
             render_pair_table(
                 [
@@ -3368,7 +3343,7 @@ def render_workbench_editor(workflow_df: pd.DataFrame, filtered_df: pd.DataFrame
     if filtered_df.empty:
         render_empty_state(
             "No rows match the current filters",
-            "Broaden the lens, clear one or more filters, or reset the view.",
+            "Broaden the lens, clear one or more filters, or reset the view to bring the queue back into focus.",
         )
         return
 
@@ -3383,8 +3358,12 @@ def render_workbench_editor(workflow_df: pd.DataFrame, filtered_df: pd.DataFrame
         key="workflow_editor",
     )
 
-    st.session_state.workflow_drafts = sync_visible_editor_changes(workflow_df, edited_visible.reset_index())
-    st.caption(f"Showing {len(filtered_df):,} rows. Focused rows: {int(st.session_state.workflow_drafts['Selected'].fillna(False).sum()):,}.")
+    edited_visible = edited_visible.reset_index()
+    st.session_state.workflow_drafts = sync_visible_editor_changes(workflow_df, edited_visible)
+
+    st.caption(
+        f"Showing {len(filtered_df):,} rows. Focused rows: {int(st.session_state.workflow_drafts['Selected'].fillna(False).sum()):,}."
+    )
     render_selected_rows_panel(st.session_state.workflow_drafts.copy())
 
 
@@ -3392,7 +3371,7 @@ def render_workflow_insights(session, workflow_df: pd.DataFrame, filtered_df: pd
     if filtered_df.empty:
         render_empty_state(
             "Insights are waiting on visible data",
-            "The current filter set hides all rows. Expand the lens to see request mix and outcomes.",
+            "The current filter set hides all rows. Expand the lens to see request mix, outcomes, and review concentration.",
         )
         return
 
@@ -3407,20 +3386,29 @@ def render_workflow_insights(session, workflow_df: pd.DataFrame, filtered_df: pd
 
     left, right = st.columns([1.05, 0.95], gap="large")
     with left:
-        st.altair_chart(make_horizontal_bar_chart(request_rollup, "Request Bucket", "Rows", "Request mix", REQUEST_BUCKET_ORDER), use_container_width=True, theme=None)
+        st.altair_chart(
+            make_horizontal_bar_chart(request_rollup, "Request Bucket", "Rows", "Request mix", REQUEST_BUCKET_ORDER),
+        )
     with right:
-        st.altair_chart(make_donut_chart(outcome_rollup, "Outcome Reporting", "Rows", "Outcome distribution"), use_container_width=True, theme=None)
+        st.altair_chart(
+            make_donut_chart(outcome_rollup, "Outcome Reporting", "Rows", "Outcome distribution"),
+        )
 
     lower_left, lower_right = st.columns([1.0, 1.0], gap="large")
     with lower_left:
-        st.altair_chart(make_vertical_bar_chart(business_rollup, "Business", "Rows", "Top businesses in view"), use_container_width=True, theme=None)
+        st.altair_chart(
+            make_vertical_bar_chart(business_rollup, "Business", "Rows", "Top businesses in view"),
+        )
     with lower_right:
         st.markdown("##### Rule coverage snapshot")
         st.table(load_rule_catalog_summary(session))
 
     st.markdown("##### Review concentration")
     if review_reason_rollup.empty:
-        render_empty_state("No active review reasons", "The visible rows currently have no validation or review flags.")
+        render_empty_state(
+            "No active review reasons",
+            "The visible rows currently have no validation or analyst-review flags.",
+        )
     else:
         st.table(review_reason_rollup)
 
@@ -3446,18 +3434,27 @@ def render_review_queue(workflow_df: pd.DataFrame, filtered_df: pd.DataFrame) ->
     with left:
         st.markdown("##### Needs review queue")
         if review_df.empty:
-            render_empty_state("No visible rows need review", "The current visible queue has no active review flags.")
+            render_empty_state(
+                "No visible rows need review",
+                "Either the deterministic rules settled the current view cleanly or the active filters narrowed the review queue away.",
+            )
         else:
             st.dataframe(review_df[REVIEW_COLUMNS], use_container_width=True, hide_index=True, height=420)
 
     with right:
         st.markdown("##### Review reasons")
         reason_rollup = build_rollup(review_df["Validation Status"], "Validation Status", fallback="Needs analyst judgment")
-        st.table(reason_rollup) if not reason_rollup.empty else render_empty_state("No review reasons captured", "Validation messages will appear here.")
+        if reason_rollup.empty:
+            render_empty_state("No review reasons captured", "Validation messages will appear here when rows are flagged.")
+        else:
+            st.table(reason_rollup)
 
         st.markdown("##### Exclusion reasons")
         exclusion_rollup = build_rollup(excluded_df["Excluded Reason"], "Excluded Reason", fallback="Excluded")
-        st.table(exclusion_rollup) if not exclusion_rollup.empty else render_empty_state("No exclusions in view", "Excluded rows will appear here.")
+        if exclusion_rollup.empty:
+            render_empty_state("No exclusions in view", "Excluded rows or reasons will appear here when present.")
+        else:
+            st.table(exclusion_rollup)
 
 
 def render_workflow_dashboard(session, reporting_date: date, uploaded_file) -> None:
@@ -3482,9 +3479,18 @@ def render_workflow_dashboard(session, reporting_date: date, uploaded_file) -> N
     )
 
     action_cols = st.columns([1.2, 1.0, 1.0, 1.0], gap="small")
-    run_rules_clicked = action_cols[0].button("Run harvested rules", type="primary")
-    save_clicked = action_cols[1].button("Save to Snowflake", disabled=workflow_table is None or session is None)
-    reload_clicked = action_cols[2].button("Reload warehouse", disabled=uploaded_file is not None or session is None)
+    run_rules_clicked = action_cols[0].button(
+        "Run harvested rules",
+        type="primary",
+    )
+    save_clicked = action_cols[1].button(
+        "Save to Snowflake",
+        disabled=workflow_table is None,
+    )
+    reload_clicked = action_cols[2].button(
+        "Reload warehouse",
+        disabled=uploaded_file is not None,
+    )
 
     export_df = workflow_df.drop(
         columns=[
@@ -3524,13 +3530,21 @@ def render_workflow_dashboard(session, reporting_date: date, uploaded_file) -> N
     filtered_df = render_workflow_filter_bar(workflow_df)
     render_workflow_overview_metrics(workflow_df, filtered_df)
 
-    workbench_tab, insights_tab, review_tab = st.tabs(["Workbench", "Insights", "Review Queue"])
-    with workbench_tab:
-        render_workbench_editor(workflow_df, filtered_df)
-    with insights_tab:
-        render_workflow_insights(session, workflow_df, filtered_df)
-    with review_tab:
-        render_review_queue(workflow_df, filtered_df)
+    workbench_tab, insights_tab, review_tab = st.tabs(
+        ["Workbench", "Insights", "Review Queue"],
+    )
+
+    if True:
+        with workbench_tab:
+            render_workbench_editor(workflow_df, filtered_df)
+
+    if True:
+        with insights_tab:
+            render_workflow_insights(session, workflow_df, filtered_df)
+
+    if True:
+        with review_tab:
+            render_review_queue(workflow_df, filtered_df)
 
     if save_clicked:
         to_save = st.session_state.workflow_drafts.copy()
@@ -3551,6 +3565,7 @@ def render_workflow_dashboard(session, reporting_date: date, uploaded_file) -> N
 def build_outcome_filter_mask(df: pd.DataFrame) -> pd.Series:
     mask = pd.Series(True, index=df.index)
     scope = st.session_state.get("out_scope", "All")
+
     if scope == "Approved":
         mask &= df["Outcome Reporting"].fillna("").astype(str).str.lower().isin(["approved", "1x approved"])
     elif scope == "Denied":
@@ -3560,10 +3575,13 @@ def build_outcome_filter_mask(df: pd.DataFrame) -> pd.Series:
     elif scope == "Needs Review":
         mask &= df["Needs Review"].fillna(False)
 
-    for state_key, column in [("out_business", "Business"), ("out_type", "Type")]:
-        values = st.session_state.get(state_key, [])
-        if values:
-            mask &= df[column].fillna("").isin(values)
+    business_filter = st.session_state.get("out_business", [])
+    if business_filter:
+        mask &= df["Business"].fillna("").isin(business_filter)
+
+    type_filter = st.session_state.get("out_type", [])
+    if type_filter:
+        mask &= df["Type"].fillna("").isin(type_filter)
 
     mask &= build_search_mask(df, OUTCOME_SEARCH_COLUMNS, st.session_state.get("out_search", ""))
     return mask
@@ -3571,15 +3589,40 @@ def build_outcome_filter_mask(df: pd.DataFrame) -> pd.Series:
 
 def render_outcome_filter_bar(df: pd.DataFrame) -> pd.DataFrame:
     search_col, lens_col, filter_col = st.columns([1.55, 1.15, 1.0], gap="small", vertical_alignment="bottom")
+
     with search_col:
-        st.text_input("Search outcomes", placeholder="Case, vendor, description, action, notes...", key="out_search")
+        st.text_input(
+            "Search outcomes",
+            placeholder="Case, vendor, description, action, notes…",
+            key="out_search",
+        )
+
     with lens_col:
-        st.segmented_control("Outcome lens", options=OUTCOME_LENS_OPTIONS, key="out_scope", width="stretch")
+        st.segmented_control(
+            "Outcome lens",
+            options=OUTCOME_LENS_OPTIONS,
+            key="out_scope",
+            width="stretch",
+        )
+
     with filter_col:
-        with st.popover("Advanced filters"):
-            st.multiselect("Business", options=sorted(v for v in df["Business"].dropna().astype(str).unique() if v), key="out_business")
-            st.multiselect("Request type", options=sorted(v for v in df["Type"].dropna().astype(str).unique() if v), key="out_type")
-            st.button("Reset filters", on_click=reset_outcome_filters)
+        with st.popover(
+            "Advanced filters",
+        ):
+            st.multiselect(
+                "Business",
+                options=sorted(v for v in df["Business"].dropna().astype(str).unique() if v),
+                key="out_business",
+            )
+            st.multiselect(
+                "Request type",
+                options=sorted(v for v in df["Type"].dropna().astype(str).unique() if v),
+                key="out_type",
+            )
+            st.button(
+                "Reset filters",
+                on_click=reset_outcome_filters,
+            )
 
     filtered_df = df.loc[build_outcome_filter_mask(df)].copy()
     render_status_ribbon(
@@ -3595,19 +3638,23 @@ def render_outcome_filter_bar(df: pd.DataFrame) -> pd.DataFrame:
 def render_outcome_reporting(session, reporting_date: date, uploaded_file) -> None:
     workflow_df = ensure_workflow_source_loaded(session, reporting_date, uploaded_file)
     preview_mode = False
+
     if "Request Bucket" not in workflow_df.columns or workflow_df["Request Bucket"].fillna("").eq("").all():
-        workflow_df = run_harvested_alpha_rules(workflow_df, load_reference_data(session))
+        refs = load_reference_data(session)
+        workflow_df = run_harvested_alpha_rules(workflow_df, refs)
         preview_mode = True
 
+    source_label = "Current in-memory workflow draft" if "workflow_drafts" in st.session_state else "Snowflake workflow rows"
     render_status_ribbon(
         [
-            ("Source", "Current workflow draft"),
+            ("Source", source_label),
             ("Mode", "Preview rule run" if preview_mode else "Current draft"),
             ("Rows", len(workflow_df)),
         ]
     )
 
     filtered_df = render_outcome_filter_bar(workflow_df)
+
     outcome_rollup_all = build_rollup(workflow_df["Outcome Reporting"], "Outcome Reporting", OUTCOME_REPORT_ORDER, fallback="assigned")
     approved_count = int(outcome_rollup_all.loc[outcome_rollup_all["Outcome Reporting"].isin(["approved", "1x approved"]), "Rows"].sum())
     denied_count = int(outcome_rollup_all.loc[outcome_rollup_all["Outcome Reporting"] == "denied", "Rows"].sum())
@@ -3630,26 +3677,41 @@ def render_outcome_reporting(session, reporting_date: date, uploaded_file) -> No
         mime="text/csv",
     )
 
-    summary_tab, detail_tab = st.tabs(["Summary", "Records"])
-    with summary_tab:
-        if filtered_df.empty:
-            render_empty_state("No rows match the current outcome filters", "Broaden the current outcome lens or reset the filters.")
-        else:
-            outcome_rollup = build_rollup(filtered_df["Outcome Reporting"], "Outcome Reporting", OUTCOME_REPORT_ORDER, fallback="assigned")
-            request_rollup = build_rollup(filtered_df["Request Bucket"], "Request Bucket", REQUEST_BUCKET_ORDER, fallback="Unbucketed")
-            business_rollup = build_rollup(filtered_df["Business"], "Business").head(8)
-            left, right = st.columns([0.95, 1.05], gap="large")
-            with left:
-                st.altair_chart(make_donut_chart(outcome_rollup, "Outcome Reporting", "Rows", "Outcome distribution"), use_container_width=True, theme=None)
-            with right:
-                st.altair_chart(make_horizontal_bar_chart(request_rollup, "Request Bucket", "Rows", "Request buckets", REQUEST_BUCKET_ORDER), use_container_width=True, theme=None)
-            st.altair_chart(make_vertical_bar_chart(business_rollup, "Business", "Rows", "Top businesses in view"), use_container_width=True, theme=None)
+    summary_tab, detail_tab = st.tabs(
+        ["Summary", "Records"],
+    )
 
-    with detail_tab:
-        if filtered_df.empty:
-            render_empty_state("No records to display", "Adjust the current filters to inspect the row-level outcome detail table.")
-        else:
-            st.dataframe(filtered_df[OUTCOME_DETAIL_COLUMNS], use_container_width=True, hide_index=True, height=620)
+    if True:
+        with summary_tab:
+            if filtered_df.empty:
+                render_empty_state(
+                    "No rows match the current outcome filters",
+                    "Broaden the current outcome lens or reset the filters to bring records back into view.",
+                )
+            else:
+                outcome_rollup = build_rollup(filtered_df["Outcome Reporting"], "Outcome Reporting", OUTCOME_REPORT_ORDER, fallback="assigned")
+                request_rollup = build_rollup(filtered_df["Request Bucket"], "Request Bucket", REQUEST_BUCKET_ORDER, fallback="Unbucketed")
+                business_rollup = build_rollup(filtered_df["Business"], "Business").head(8)
+
+                left, right = st.columns([0.95, 1.05], gap="large")
+                with left:
+                    st.altair_chart(make_donut_chart(outcome_rollup, "Outcome Reporting", "Rows", "Outcome distribution"), use_container_width=True)
+                with right:
+                    st.altair_chart(
+                        make_horizontal_bar_chart(request_rollup, "Request Bucket", "Rows", "Request buckets", REQUEST_BUCKET_ORDER),
+                    )
+
+                st.altair_chart(make_vertical_bar_chart(business_rollup, "Business", "Rows", "Top businesses in view"), use_container_width=True)
+
+    if True:
+        with detail_tab:
+            if filtered_df.empty:
+                render_empty_state(
+                    "No records to display",
+                    "Adjust the current filters to inspect the row-level outcome detail table.",
+                )
+            else:
+                st.dataframe(filtered_df[OUTCOME_DETAIL_COLUMNS], use_container_width=True, hide_index=True, height=620)
 
 
 def filter_rule_catalog(rule_catalog: pd.DataFrame) -> pd.DataFrame:
@@ -3671,22 +3733,42 @@ def filter_rule_catalog(rule_catalog: pd.DataFrame) -> pd.DataFrame:
     search_text = st.session_state.get("catalog_search", "")
     if clean_text(search_text):
         filtered = filtered.loc[build_search_mask(filtered, filtered.columns.tolist(), search_text)]
+
     return filtered.copy()
 
 
 def render_catalog_filters(rule_catalog: pd.DataFrame) -> pd.DataFrame:
     search_col, filter_col = st.columns([1.65, 1.0], gap="small", vertical_alignment="bottom")
+
     with search_col:
-        st.text_input("Search rules", placeholder="Rule id, condition, recommendation, exception...", key="catalog_search")
+        st.text_input(
+            "Search rules",
+            placeholder="Rule id, condition, recommendation, exception…",
+            key="catalog_search",
+        )
+
     with filter_col:
-        with st.popover("Catalog filters"):
+        with st.popover(
+            "Catalog filters",
+        ):
             auto_col = next((col for col in rule_catalog.columns if str(col).upper() == "AUTOMATION_CANDIDATE"), None)
             alpha_col = next((col for col in rule_catalog.columns if str(col).upper() == "ALPHA_RECOMMENDATION"), None)
             if auto_col:
-                st.multiselect("Automation Candidate", options=sorted(v for v in rule_catalog[auto_col].dropna().astype(str).unique() if v), key="catalog_auto")
+                st.multiselect(
+                    "Automation Candidate",
+                    options=sorted(v for v in rule_catalog[auto_col].dropna().astype(str).unique() if v),
+                    key="catalog_auto",
+                )
             if alpha_col:
-                st.multiselect("Alpha Recommendation", options=sorted(v for v in rule_catalog[alpha_col].dropna().astype(str).unique() if v), key="catalog_alpha")
-            st.button("Reset filters", on_click=reset_catalog_filters)
+                st.multiselect(
+                    "Alpha Recommendation",
+                    options=sorted(v for v in rule_catalog[alpha_col].dropna().astype(str).unique() if v),
+                    key="catalog_alpha",
+                )
+            st.button(
+                "Reset filters",
+                on_click=reset_catalog_filters,
+            )
 
     filtered = filter_rule_catalog(rule_catalog)
     render_status_ribbon(
@@ -3724,7 +3806,7 @@ def render_rule_catalog(session) -> None:
         st.table(summary)
         render_empty_state(
             "The rule catalog table is not populated",
-            "Seed the rule catalog table to browse harvested rule inventory and automation recommendations.",
+            "Seed the rule catalog table to browse harvested rule inventory and automation recommendations inside this view.",
         )
         return
 
@@ -3736,40 +3818,57 @@ def render_rule_catalog(session) -> None:
         mime="text/csv",
     )
 
-    overview_tab, inventory_tab = st.tabs(["Overview", "Rule inventory"])
-    with overview_tab:
-        auto_rollup = pd.DataFrame({"Automation Candidate": ["Yes", "Partial", "No"], "Rows": [auto_yes, auto_partial, auto_no]})
-        alpha_rollup = pd.DataFrame({"Alpha Recommendation": ["Alpha", "Guided", "Future"], "Rows": [alpha_rules, guided_rules, future_rules]})
-        left, right = st.columns(2, gap="large")
-        with left:
-            st.altair_chart(make_vertical_bar_chart(auto_rollup, "Automation Candidate", "Rows", "Automation coverage"), use_container_width=True, theme=None)
-        with right:
-            st.altair_chart(make_vertical_bar_chart(alpha_rollup, "Alpha Recommendation", "Rows", "Alpha recommendation mix"), use_container_width=True, theme=None)
-        st.markdown("##### Summary table")
-        st.table(summary)
+    overview_tab, inventory_tab = st.tabs(
+        ["Overview", "Rule inventory"],
+    )
 
-    with inventory_tab:
-        if filtered_catalog.empty:
-            render_empty_state("No catalog rows match the current filters", "Clear or broaden the current catalog filters.")
-        else:
-            st.dataframe(filtered_catalog, use_container_width=True, hide_index=True, height=680)
+    if True:
+        with overview_tab:
+            auto_rollup = pd.DataFrame(
+                {
+                    "Automation Candidate": ["Yes", "Partial", "No"],
+                    "Rows": [auto_yes, auto_partial, auto_no],
+                }
+            )
+            alpha_rollup = pd.DataFrame(
+                {
+                    "Alpha Recommendation": ["Alpha", "Guided", "Future"],
+                    "Rows": [alpha_rules, guided_rules, future_rules],
+                }
+            )
+            left, right = st.columns(2, gap="large")
+            with left:
+                st.altair_chart(
+                    make_vertical_bar_chart(auto_rollup, "Automation Candidate", "Rows", "Automation coverage"),
+                )
+            with right:
+                st.altair_chart(
+                    make_vertical_bar_chart(alpha_rollup, "Alpha Recommendation", "Rows", "Alpha recommendation mix"),
+                )
+            st.markdown("##### Summary table")
+            st.table(summary)
+
+    if True:
+        with inventory_tab:
+            if filtered_catalog.empty:
+                render_empty_state(
+                    "No catalog rows match the current filters",
+                    "Clear or broaden the current catalog filters to bring rule inventory rows back into view.",
+                )
+            else:
+                st.dataframe(filtered_catalog, use_container_width=True, hide_index=True, height=680)
 
 
-def main() -> None:
-    bootstrap_ui_state()
-    inject_global_styles()
-    session = get_session()
-    app_view, reporting_date, uploaded_file = render_shell(session)
-    render_sidebar(session, reporting_date, uploaded_file)
-    render_notice()
+bootstrap_ui_state()
+inject_global_styles()
+session = get_session()
+app_view, reporting_date, uploaded_file = render_shell(session)
+render_sidebar(session, reporting_date, uploaded_file)
+render_notice()
 
-    if app_view == "Outcome Reporting":
-        render_outcome_reporting(session, reporting_date, uploaded_file)
-    elif app_view == "Rule Catalog":
-        render_rule_catalog(session)
-    else:
-        render_workflow_dashboard(session, reporting_date, uploaded_file)
-
-
-if __name__ == "__main__":
-    main()
+if app_view == "Outcome Reporting":
+    render_outcome_reporting(session, reporting_date, uploaded_file)
+elif app_view == "Rule Catalog":
+    render_rule_catalog(session)
+else:
+    render_workflow_dashboard(session, reporting_date, uploaded_file)
