@@ -1,0 +1,10 @@
+name: compliance-rules
+channels:
+  - snowflake
+dependencies:
+  - python=3.11
+  - streamlit
+  - pandas
+  - altair
+  - openpyxl
+  - snowflake-snowpark-python
